@@ -3,8 +3,9 @@ backend/__pycache__/
 backend/app/__pycache__/
 backend/app/routers/__pycache__/
 backend/tests/__pycache__/
-backend/*.db
+*.db
 backend/.env
 frontend/node_modules/
 frontend/dist/
+frontend/*.tsbuildinfo
 *.pyc
