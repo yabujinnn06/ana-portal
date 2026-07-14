@@ -1,0 +1,16 @@
+import axios from 'axios'
+
+import { demoAdapter, isDemoMode } from '../utils/demo'
+
+const defaultBase = typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1:8000'
+const baseURL = import.meta.env.VITE_API_BASE_URL ?? defaultBase
+
+export const apiClient = axios.create({
+  baseURL,
+  withCredentials: true,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+  // ?demo=1: backend olmadan ornek veriyle calis (sadece dev/gosterim).
+  ...(isDemoMode() ? { adapter: demoAdapter } : {}),
+})

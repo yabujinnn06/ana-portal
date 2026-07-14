@@ -1,0 +1,19 @@
+{
+  "name": "Rainwater Sayim Sistemi",
+  "short_name": "Rainwater",
+  "start_url": "/depo/",
+  "scope": "/depo/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#3A4233",
+  "theme_color": "#3E4637",
+  "lang": "tr",
+  "icons": [
+    {
+      "src": "/depo/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -1,0 +1,900 @@
+import { useEffect, useMemo, useState } from 'react'
+import { useQueries, useQuery } from '@tanstack/react-query'
+
+import {
+  getControlRoomOverview,
+  getDepartments,
+  getEmployees,
+  getLocationMonitorEmployeeMapPoints,
+  getLocationMonitorEmployeeTimelineEvents,
+  getRegions,
+} from '../../api/admin'
+import { ErrorBlock } from '../ErrorBlock'
+import { LoadingBlock } from '../LoadingBlock'
+import { PageHeader } from '../PageHeader'
+import { usePageVisibility } from '../../hooks/usePageVisibility'
+import { controlRoomQueryKeys } from './queryKeys'
+import { EmployeeDailyRouteTable, type EmployeeDailyRouteRow, type RouteSortField } from './EmployeeDailyRouteTable'
+import { ControlRoomUnifiedMap } from './ControlRoomUnifiedMap'
+import { SourceFilterBar } from './SourceFilterBar'
+import { TrackingDashboard } from './TrackingDashboard'
+import {
+  sourceKey,
+  dayCountForRange,
+  formatDateTime,
+  latestAvailablePoint,
+  rangeLabel,
+} from './utils'
+import { defaultFilters, type FilterFormState, toOverviewParams } from '../management-console/types'
+import type {
+  ControlRoomEmployeeState,
+  LocationMonitorDayRecord,
+  LocationMonitorMapPoint,
+  LocationMonitorPointSource,
+  LocationMonitorTimelineEvent,
+  LocationMonitorTimelineResponse,
+} from '../../types/api'
+
+type MapMode = 'fleet' | 'employeeDay'
+type MobileView = 'days' | 'map'
+
+const SOURCE_OPTIONS: Array<{ value: LocationMonitorPointSource; label: string }> = [
+  { value: 'CHECKIN', label: 'Mesai girisi' },
+  { value: 'CHECKOUT', label: 'Mesai cikisi' },
+  { value: 'APP_OPEN', label: 'App girisi' },
+  { value: 'APP_CLOSE', label: 'App cikisi' },
+  { value: 'DEMO_START', label: 'Demo baslangici' },
+  { value: 'DEMO_END', label: 'Demo bitisi' },
+  { value: 'LOCATION_PING', label: 'Konum pingi' },
+]
+
+const ALL_SOURCES = SOURCE_OPTIONS.map((item) => item.value)
+
+function useIsMobile(breakpoint = 1024): boolean {
+  const [isMobile, setIsMobile] = useState(() => {
+    if (typeof window === 'undefined') return false
+    return window.innerWidth < breakpoint
+  })
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+
+    const mediaQuery = window.matchMedia(`(max-width:${breakpoint - 1}px)`)
+    const update = () => setIsMobile(mediaQuery.matches)
+    update()
+
+    if (typeof mediaQuery.addEventListener === 'function') {
+      mediaQuery.addEventListener('change', update)
+      return () => mediaQuery.removeEventListener('change', update)
+    }
+
+    mediaQuery.addListener(update)
+    return () => mediaQuery.removeListener(update)
+  }, [breakpoint])
+
+  return isMobile
+}
+
+function activeFilterEntries(filters: FilterFormState, employeeNames: Map<number, string>): string[] {
+  const entries: string[] = []
+  if (filters.employee_id) {
+    const employeeId = Number(filters.employee_id)
+    const employeeLabel = employeeNames.get(employeeId)
+    entries.push(employeeLabel ? `Personel: ${employeeLabel}` : `Personel #${filters.employee_id}`)
+  }
+  if (filters.q.trim()) entries.push(`Arama: ${filters.q.trim()}`)
+  if (filters.region_id) entries.push(`Bölge #${filters.region_id}`)
+  if (filters.department_id) entries.push(`Departman #${filters.department_id}`)
+  if (filters.include_inactive) entries.push('Pasif çalışanlar dahil')
+  return entries
+}
+
+function prioritySort(left: ControlRoomEmployeeState, right: ControlRoomEmployeeState): number {
+  const riskOrder = { CRITICAL: 0, WATCH: 1, NORMAL: 2 }
+  const riskDelta = riskOrder[left.risk_status] - riskOrder[right.risk_status]
+  if (riskDelta !== 0) return riskDelta
+
+  if (left.risk_score !== right.risk_score) {
+    return right.risk_score - left.risk_score
+  }
+
+  return new Date(right.last_activity_utc ?? 0).getTime() - new Date(left.last_activity_utc ?? 0).getTime()
+}
+
+function buildFallbackDayEvents(
+  timelineData: LocationMonitorTimelineResponse | null,
+  day: string | null,
+  enabledSources: LocationMonitorPointSource[],
+): LocationMonitorTimelineEvent[] {
+  if (!timelineData || !day) return []
+
+  return timelineData.events
+    .filter((event) => event.day === day && enabledSources.includes(event.source))
+    .sort((left, right) => new Date(right.ts_utc).getTime() - new Date(left.ts_utc).getTime())
+}
+
+function dailyGeofence(day: LocationMonitorDayRecord): {
+  label: string
+  tone: EmployeeDailyRouteRow['geofenceTone']
+} {
+  const lastPoint = day.last_location_point ?? latestAvailablePoint(day)
+  if (day.outside_geofence_count > 0 || lastPoint?.geofence_status === 'OUTSIDE') {
+    return { label: 'Disari', tone: 'outside' }
+  }
+  if (lastPoint?.geofence_status === 'INSIDE') {
+    return { label: 'Iceride', tone: 'inside' }
+  }
+  return { label: 'Bilinmiyor', tone: 'unknown' }
+}
+
+function firstTimestamp(day: LocationMonitorDayRecord, points: LocationMonitorMapPoint[]): string | null {
+  return day.check_in ?? day.first_app_open_utc ?? day.first_demo_start_utc ?? points[0]?.ts_utc ?? null
+}
+
+function lastTimestamp(day: LocationMonitorDayRecord, points: LocationMonitorMapPoint[]): string | null {
+  return (
+    day.check_out ??
+    day.last_app_close_utc ??
+    day.last_demo_end_utc ??
+    points[points.length - 1]?.ts_utc ??
+    latestAvailablePoint(day)?.ts_utc ??
+    null
+  )
+}
+
+function CompactFilters({
+  filters,
+  employees,
+  regions,
+  departments,
+  activeEntries,
+  onChange,
+  onApply,
+  onReset,
+}: {
+  filters: FilterFormState
+  employees: Array<{ id: number; full_name: string }>
+  regions: Array<{ id: number; name: string }>
+  departments: Array<{ id: number; name: string }>
+  activeEntries: string[]
+  onChange: (next: FilterFormState) => void
+  onApply: () => void
+  onReset: () => void
+}) {
+  return (
+    <section className="cr-inline-filters">
+      <div className="cr-inline-filters__grid">
+        <label className="cr-ops-field">
+          <span>Personel</span>
+          <select
+            value={filters.employee_id}
+            onChange={(event) =>
+              onChange({
+                ...filters,
+                employee_id: event.target.value,
+                q: event.target.value ? '' : filters.q,
+              })
+            }
+          >
+            <option value="">Tüm personeller</option>
+            {employees.map((employee) => (
+              <option key={employee.id} value={employee.id}>
+                {`#${employee.id} - ${employee.full_name}`}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="cr-ops-field">
+          <span>Arama</span>
+          <input
+            value={filters.q}
+            onChange={(event) =>
+              onChange({
+                ...filters,
+                q: event.target.value,
+                employee_id: event.target.value.trim() ? '' : filters.employee_id,
+              })
+            }
+            placeholder="Ad, soyad veya #ID"
+          />
+        </label>
+        <label className="cr-ops-field">
+          <span>Bölge</span>
+          <select
+            value={filters.region_id}
+            onChange={(event) => onChange({ ...filters, region_id: event.target.value })}
+          >
+            <option value="">Tüm bolgeler</option>
+            {regions.map((region) => (
+              <option key={region.id} value={region.id}>
+                {region.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="cr-ops-field">
+          <span>Departman</span>
+          <select
+            value={filters.department_id}
+            onChange={(event) => onChange({ ...filters, department_id: event.target.value })}
+          >
+            <option value="">Tüm departmanlar</option>
+            {departments.map((department) => (
+              <option key={department.id} value={department.id}>
+                {department.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="cr-ops-field">
+          <span>Baslangic</span>
+          <input
+            type="date"
+            value={filters.start_date}
+            onChange={(event) => onChange({ ...filters, start_date: event.target.value })}
+          />
+        </label>
+        <label className="cr-ops-field">
+          <span>Bitis</span>
+          <input
+            type="date"
+            value={filters.end_date}
+            onChange={(event) => onChange({ ...filters, end_date: event.target.value })}
+          />
+        </label>
+      </div>
+
+      <div className="cr-inline-filters__footer">
+        <div className="cr-ops-active-tags">
+          {activeEntries.length ? (
+            activeEntries.map((entry) => (
+              <span key={entry} className="cr-ops-active-tag">
+                {entry}
+              </span>
+            ))
+          ) : (
+            <span className="cr-ops-active-tag">Aktif filtre yok</span>
+          )}
+        </div>
+        <div className="cr-inline-filters__actions">
+          <button type="button" className="cr-ops-action is-secondary" onClick={onReset}>
+            Sıfırla
+          </button>
+          <button type="button" className="cr-ops-action" onClick={onApply}>
+            Uygula
+          </button>
+        </div>
+      </div>
+    </section>
+  )
+}
+
+export function ControlRoomPage() {
+  const isMobile = useIsMobile()
+  const isPageVisible = usePageVisibility()
+  const [selectedEmployeeId, setSelectedEmployeeId] = useState<number | null>(null)
+  const [selectedDay, setSelectedDay] = useState<string | null>(null)
+  const [selectedEventId, setSelectedEventId] = useState<string | null>(null)
+  const [mapMode, setMapMode] = useState<MapMode>('fleet')
+  const [mobileView, setMobileView] = useState<MobileView>('days')
+  const [draftFilters, setDraftFilters] = useState<FilterFormState>(() => defaultFilters())
+  const [appliedFilters, setAppliedFilters] = useState<FilterFormState>(() => defaultFilters())
+  const [filtersOpen, setFiltersOpen] = useState(!isMobile)
+  const [enabledSources, setEnabledSources] = useState<LocationMonitorPointSource[]>(ALL_SOURCES)
+  const [routeSort, setRouteSort] = useState<{ field: RouteSortField; dir: 'asc' | 'desc' }>({
+    field: 'date',
+    dir: 'desc',
+  })
+
+  useEffect(() => {
+    if (!isMobile) {
+      setFiltersOpen(true)
+    }
+  }, [isMobile])
+
+  const overviewParams = useMemo(
+    () => ({
+      ...toOverviewParams(appliedFilters, 1),
+    }),
+    [appliedFilters],
+  )
+
+  const overviewQuery = useQuery({
+    queryKey: controlRoomQueryKeys.overview(overviewParams),
+    queryFn: () => getControlRoomOverview(overviewParams),
+    staleTime: 30_000,
+    placeholderData: (previousData) => previousData,
+    refetchInterval: isPageVisible ? 25_000 : false,
+    refetchIntervalInBackground: false,
+  })
+
+  const regionsQuery = useQuery({
+    queryKey: controlRoomQueryKeys.regions,
+    queryFn: () => getRegions(),
+    staleTime: 5 * 60_000,
+  })
+
+  const departmentsQuery = useQuery({
+    queryKey: controlRoomQueryKeys.departments,
+    queryFn: () => getDepartments(),
+    staleTime: 5 * 60_000,
+  })
+
+  const employeesQuery = useQuery({
+    queryKey: controlRoomQueryKeys.employees,
+    queryFn: () => getEmployees({ include_inactive: true, status: 'all' }),
+    staleTime: 5 * 60_000,
+  })
+
+  const overview = overviewQuery.data ?? null
+  const employees = employeesQuery.data ?? []
+  const employeeNames = useMemo(
+    () => new Map(employees.map((employee) => [employee.id, employee.full_name])),
+    [employees],
+  )
+
+  const employeeStateMap = useMemo(
+    () => new Map((overview?.items ?? []).map((item) => [item.employee.id, item])),
+    [overview?.items],
+  )
+
+  const selectedEmployeeState =
+    (selectedEmployeeId != null ? employeeStateMap.get(selectedEmployeeId) : null) ?? null
+
+  const mapPoints = useMemo(() => {
+    return (overview?.map_points ?? [])
+      .map((point) => {
+        const employeeState = employeeStateMap.get(point.employee_id)
+        if (!employeeState) return null
+        return {
+          employeeId: point.employee_id,
+          employeeName: point.employee_name,
+          departmentName: point.department_name,
+          lat: point.lat,
+          lon: point.lon,
+          tsUtc: point.ts_utc,
+          label: point.label,
+          locationState: point.location_state,
+          riskStatus: employeeState.risk_status,
+          todayStatus: point.today_status,
+        }
+      })
+      .filter((point): point is NonNullable<typeof point> => point != null)
+  }, [employeeStateMap, overview?.map_points])
+
+  const employeesInScope = useMemo(
+    () => [...(overview?.items ?? [])].sort(prioritySort),
+    [overview?.items],
+  )
+
+  const liveLocationCount = useMemo(
+    () => (overview?.items ?? []).filter((item) => item.location_state === 'LIVE').length,
+    [overview?.items],
+  )
+
+  const employeeTimelineQueries = useQueries({
+    queries: employeesInScope.map((employeeState) => ({
+      queryKey: controlRoomQueryKeys.focusTimeline(employeeState.employee.id, {
+        start_date: appliedFilters.start_date,
+        end_date: appliedFilters.end_date,
+        latest_only: false,
+      }),
+      queryFn: () =>
+        getLocationMonitorEmployeeTimelineEvents(employeeState.employee.id, {
+          start_date: appliedFilters.start_date,
+          end_date: appliedFilters.end_date,
+          latest_only: false,
+        }),
+      staleTime: 30_000,
+      placeholderData: (previousData: Awaited<ReturnType<typeof getLocationMonitorEmployeeTimelineEvents>> | undefined) =>
+        previousData,
+    })),
+  })
+
+  const dailyRows = useMemo<EmployeeDailyRouteRow[]>(() => {
+    const rows: EmployeeDailyRouteRow[] = []
+
+    employeesInScope.forEach((employeeState, index) => {
+      const timelineData = employeeTimelineQueries[index]?.data
+      if (!timelineData) return
+
+      timelineData.days.forEach((day) => {
+        const geofence = dailyGeofence(day)
+
+        rows.push({
+          employeeId: employeeState.employee.id,
+          employeeName: employeeState.employee.full_name,
+          date: day.date,
+          firstTimestamp: firstTimestamp(day, []),
+          lastTimestamp: lastTimestamp(day, []),
+          pointCount: day.point_count || day.event_count,
+          distanceMeters: day.distance_m,
+          geofenceLabel: geofence.label,
+          geofenceTone: geofence.tone,
+          suspiciousJumpCount: day.suspicious_jump_count,
+          lowAccuracyCount: day.low_accuracy_count,
+          workedMinutes: day.worked_minutes,
+        })
+      })
+    })
+
+    const filteredRows = selectedEmployeeId != null
+      ? rows.filter((row) => row.employeeId === selectedEmployeeId)
+      : rows
+
+    const dir = routeSort.dir === 'asc' ? 1 : -1
+    return filteredRows.sort((left, right) => {
+      if (routeSort.field === 'employee') {
+        const cmp = left.employeeName.localeCompare(right.employeeName, 'tr')
+        if (cmp !== 0) return cmp * dir
+        return new Date(right.date).getTime() - new Date(left.date).getTime()
+      }
+      if (routeSort.field === 'distance') {
+        const cmp = (left.distanceMeters ?? 0) - (right.distanceMeters ?? 0)
+        if (cmp !== 0) return cmp * dir
+        return new Date(right.date).getTime() - new Date(left.date).getTime()
+      }
+      if (routeSort.field === 'worked') {
+        const cmp = left.workedMinutes - right.workedMinutes
+        if (cmp !== 0) return cmp * dir
+        return new Date(right.date).getTime() - new Date(left.date).getTime()
+      }
+      // date (default)
+      if (left.date !== right.date) {
+        return (new Date(left.date).getTime() - new Date(right.date).getTime()) * dir
+      }
+      return left.employeeName.localeCompare(right.employeeName, 'tr')
+    })
+  }, [employeeTimelineQueries, employeesInScope, selectedEmployeeId, routeSort])
+
+  const hasOverviewData = Boolean(overview)
+  const dailyRowsLoading = employeeTimelineQueries.some((query) => query.isPending)
+
+  const selectedRow =
+    (selectedEmployeeId != null && selectedDay != null
+      ? dailyRows.find((row) => row.employeeId === selectedEmployeeId && row.date === selectedDay)
+      : null) ?? null
+
+  useEffect(() => {
+    if (selectedEmployeeId == null) return
+    if (employeeStateMap.has(selectedEmployeeId)) return
+    setSelectedEmployeeId(null)
+    setSelectedDay(null)
+    setSelectedEventId(null)
+    setMapMode('fleet')
+  }, [employeeStateMap, selectedEmployeeId])
+
+  useEffect(() => {
+    if (selectedDay == null || selectedEmployeeId == null) return
+    if (dailyRows.some((row) => row.employeeId === selectedEmployeeId && row.date === selectedDay)) return
+    if (dailyRowsLoading) return
+    setSelectedDay(null)
+    setSelectedEventId(null)
+    setMapMode('fleet')
+  }, [dailyRows, dailyRowsLoading, selectedDay, selectedEmployeeId])
+
+  const selectedDayQueryEnabled = selectedEmployeeId != null && selectedDay != null
+  const selectedEmployeeDataIndex = useMemo(
+    () => employeesInScope.findIndex((item) => item.employee.id === selectedEmployeeId),
+    [employeesInScope, selectedEmployeeId],
+  )
+  const selectedEmployeeTimelineData =
+    selectedEmployeeDataIndex >= 0
+      ? employeeTimelineQueries[selectedEmployeeDataIndex]?.data ?? null
+      : null
+
+  const selectedDayTimelineQuery = useQuery({
+    enabled: selectedDayQueryEnabled,
+    queryKey:
+      selectedDayQueryEnabled && selectedEmployeeId != null && selectedDay != null
+        ? controlRoomQueryKeys.focusTimeline(selectedEmployeeId, {
+            start_date: appliedFilters.start_date,
+            end_date: appliedFilters.end_date,
+            day: selectedDay,
+            latest_only: false,
+          })
+        : ['control-room', 'selected-day', 'timeline', 'idle'],
+    queryFn: () =>
+      getLocationMonitorEmployeeTimelineEvents(selectedEmployeeId!, {
+        start_date: appliedFilters.start_date,
+        end_date: appliedFilters.end_date,
+        day: selectedDay!,
+        latest_only: false,
+      }),
+    staleTime: 20_000,
+  })
+
+  const selectedDayMapQuery = useQuery({
+    enabled: selectedDayQueryEnabled,
+    queryKey:
+      selectedDayQueryEnabled && selectedEmployeeId != null && selectedDay != null
+        ? controlRoomQueryKeys.focusMap(selectedEmployeeId, {
+            start_date: appliedFilters.start_date,
+            end_date: appliedFilters.end_date,
+            day: selectedDay,
+            latest_only: false,
+            source: enabledSources.length === ALL_SOURCES.length ? undefined : enabledSources,
+          })
+        : ['control-room', 'selected-day', 'map', 'idle', sourceKey(enabledSources)],
+    queryFn: () =>
+      getLocationMonitorEmployeeMapPoints(selectedEmployeeId!, {
+        start_date: appliedFilters.start_date,
+        end_date: appliedFilters.end_date,
+        day: selectedDay!,
+        latest_only: false,
+        source: enabledSources.length === ALL_SOURCES.length ? undefined : enabledSources,
+      }),
+    staleTime: 20_000,
+  })
+
+  const fallbackSelectedDayEvents = useMemo(
+    () => buildFallbackDayEvents(selectedEmployeeTimelineData, selectedDay, enabledSources),
+    [enabledSources, selectedDay, selectedEmployeeTimelineData],
+  )
+
+  const effectiveSelectedDayMapData = selectedDayMapQuery.data ?? null
+
+  const selectedDayEvents = useMemo(() => {
+    const events = selectedDayTimelineQuery.data?.events ?? fallbackSelectedDayEvents
+    const filteredEvents =
+      enabledSources.length === ALL_SOURCES.length
+        ? events
+        : events.filter((event) => enabledSources.includes(event.source))
+    return [...filteredEvents].sort((left, right) => new Date(right.ts_utc).getTime() - new Date(left.ts_utc).getTime())
+  }, [enabledSources, fallbackSelectedDayEvents, selectedDayTimelineQuery.data?.events])
+
+  useEffect(() => {
+    if (mapMode !== 'employeeDay') {
+      if (selectedEventId != null) {
+        setSelectedEventId(null)
+      }
+      return
+    }
+
+    if (!selectedDayEvents.length) {
+      if (!selectedDayTimelineQuery.isFetching && selectedEventId != null) {
+        setSelectedEventId(null)
+      }
+      return
+    }
+
+    if (selectedEventId && selectedDayEvents.some((event) => event.id === selectedEventId)) {
+      return
+    }
+
+    setSelectedEventId(selectedDayEvents[0].id)
+  }, [mapMode, selectedDayEvents, selectedDayTimelineQuery.isFetching, selectedEventId])
+
+  const appliedDayRange = dayCountForRange(appliedFilters.start_date, appliedFilters.end_date)
+  const filterTags = useMemo(
+    () => activeFilterEntries(appliedFilters, employeeNames),
+    [appliedFilters, employeeNames],
+  )
+
+  const handleApplyFilters = () => {
+    setAppliedFilters(draftFilters)
+    setSelectedDay(null)
+    setSelectedEventId(null)
+    setMapMode('fleet')
+  }
+
+  const handleResetFilters = () => {
+    const next = defaultFilters()
+    setDraftFilters(next)
+    setAppliedFilters(next)
+    setEnabledSources(ALL_SOURCES)
+    setSelectedEmployeeId(null)
+    setSelectedDay(null)
+    setSelectedEventId(null)
+    setMapMode('fleet')
+  }
+
+  const handleSelectEmployee = (employeeId: number) => {
+    setSelectedEmployeeId(employeeId)
+    setSelectedDay(null)
+    setSelectedEventId(null)
+    setMapMode('fleet')
+  }
+
+  const handleSelectRow = (employeeId: number, day: string) => {
+    setSelectedEmployeeId(employeeId)
+    setSelectedDay(day)
+    setSelectedEventId(null)
+    setMapMode('employeeDay')
+    if (isMobile) {
+      setMobileView('map')
+    }
+  }
+
+  const handleRouteSort = (field: RouteSortField) => {
+    setRouteSort((current) =>
+      current.field === field
+        ? { field, dir: current.dir === 'asc' ? 'desc' : 'asc' }
+        : { field, dir: field === 'employee' ? 'asc' : 'desc' },
+    )
+  }
+
+  const handleCloseDayView = () => {
+    setSelectedDay(null)
+    setSelectedEventId(null)
+    setMapMode('fleet')
+    if (isMobile) {
+      setMobileView('days')
+    }
+  }
+
+  const allSourcesSelected = enabledSources.length === ALL_SOURCES.length
+
+  const handleToggleSource = (source: LocationMonitorPointSource) => {
+    setEnabledSources((current) => {
+      if (current.includes(source)) {
+        return current.length === 1 ? current : current.filter((item) => item !== source)
+      }
+      return [...current, source].sort()
+    })
+  }
+
+  const mapHeader = (
+    <header className="cr-ops-section-head">
+      <div>
+        <p className="cr-ops-kicker">Harita</p>
+        <h3>
+          {mapMode === 'employeeDay' && selectedRow
+            ? `${selectedRow.employeeName} / ${selectedRow.date}`
+            : selectedEmployeeState
+              ? `${selectedEmployeeState.employee.full_name} seçili, gün bekleniyor`
+              : 'Fleet marker görünümü'}
+        </h3>
+        <p>
+          {mapMode === 'employeeDay' && selectedRow
+            ? 'Seçilen günün tüm noktalarını ve rota izini aynı harita üstünde gösterir.'
+            : 'Marker seçimi çalışan filtreler, gün seçimi ise haritayi rota gorunumune tasir.'}
+        </p>
+      </div>
+      <div className="cr-ops-section-meta">
+        {mapMode === 'employeeDay' && (selectedDayTimelineQuery.data || fallbackSelectedDayEvents.length) ? (
+          <>
+            <span>{selectedDayEvents.length} olay</span>
+            <span>{effectiveSelectedDayMapData?.points.length ?? 0} nokta</span>
+          </>
+        ) : (
+          <>
+            <span>{mapPoints.length} marker</span>
+            <span>{dailyRows.length} gün satiri</span>
+          </>
+        )}
+        {mapMode === 'employeeDay' ? (
+          <button type="button" className="cr-ops-action" onClick={handleCloseDayView}>
+            Kapat
+          </button>
+        ) : null}
+      </div>
+    </header>
+  )
+
+  return (
+    <div className="cr-ops-page cr-ops-page--tracking">
+      <PageHeader
+        title="Çalışan Takibi"
+        description="Günlük rota listesi ve harita aynı ekranda. Marker seçimiyle çalışan filtrelenir, gün seçimiyle tek tıkta rota sonucu gelir."
+        action={
+          <div className="cr-ops-header-actions">
+            <button type="button" className="cr-ops-action" onClick={() => void overviewQuery.refetch()}>
+              <span aria-hidden="true">↻</span> Veriyi yenile
+            </button>
+            {selectedEmployeeId != null ? (
+              <button
+                type="button"
+                className="cr-ops-action is-secondary"
+                onClick={() => {
+                  setSelectedEmployeeId(null)
+                  setSelectedDay(null)
+                  setSelectedEventId(null)
+                  setMapMode('fleet')
+                }}
+              >
+                Seçimi temizle
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="cr-ops-action is-secondary"
+              onClick={() => setFiltersOpen((current) => !current)}
+            >
+              {filtersOpen ? 'Filtreleri gizle' : 'Filtreler'}
+            </button>
+          </div>
+        }
+      />
+
+      <section className="cr-ops-command-bar cr-ops-command-bar--hud">
+        <div className="cr-ops-command-bar__identity">
+          <div>
+            <p className="cr-ops-kicker">Takip HUD</p>
+            <h2>{mapMode === 'employeeDay' ? 'Çalışan-gün modu' : 'Filo modu'}</h2>
+            <p>
+              {selectedRow
+                ? `${selectedRow.employeeName} için ${selectedRow.date} günü seçili. Harita tüm konum noktalarını ve rota izini gösteriyor.`
+                : selectedEmployeeState
+                  ? `${selectedEmployeeState.employee.full_name} seçili. Gün tablosundan bir satir secerek harita sonucunu acin.`
+                  : `Varsayılan fleet mod acik. ${appliedDayRange} günlük pencere ve ${rangeLabel(appliedFilters.start_date, appliedFilters.end_date)} aktif.`}
+            </p>
+          </div>
+          <div className="cr-ops-command-bar__badges">
+            <span
+              className={`cr-ops-inline-badge cr-live-status-badge ${isPageVisible ? 'is-live' : 'is-paused'}`}
+              title={isPageVisible ? 'Otomatik yenileme aktif (25 sn)' : 'Sekme arka planda, otomatik yenileme duraklatildi'}
+            >
+              <span className="cr-live-status-badge__dot" aria-hidden="true" />
+              {isPageVisible ? 'Canlı' : 'Duraklatıldı'}
+            </span>
+            <span className="cr-ops-inline-badge">Mod: {mapMode === 'employeeDay' ? 'çalışan-gün' : 'filo'}</span>
+            <span className="cr-ops-inline-badge">{mapPoints.length} marker</span>
+            {selectedEmployeeState ? (
+              <span className="cr-ops-inline-badge">{selectedEmployeeState.employee.full_name}</span>
+            ) : null}
+            {overview?.generated_at_utc ? (
+              <span className="cr-ops-inline-badge">Son sync {formatDateTime(overview.generated_at_utc)}</span>
+            ) : null}
+          </div>
+        </div>
+
+        {isMobile ? (
+          <div className="cr-mobile-view-toggle" role="tablist" aria-label="Mobile tracking views">
+            {(['days', 'map'] as MobileView[]).map((view) => (
+              <button
+                key={view}
+                type="button"
+                className={mobileView === view ? 'is-active' : ''}
+                onClick={() => setMobileView(view)}
+              >
+                {view === 'days' ? 'Günler' : 'Harita'}
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </section>
+
+      {filtersOpen ? (
+        <CompactFilters
+          filters={draftFilters}
+          employees={employees}
+          regions={regionsQuery.data ?? []}
+          departments={departmentsQuery.data ?? []}
+          activeEntries={filterTags}
+          onChange={setDraftFilters}
+          onApply={handleApplyFilters}
+          onReset={handleResetFilters}
+        />
+      ) : filterTags.length ? (
+        <div className="cr-ops-active-tags" aria-label="Aktif filtreler">
+          {filterTags.map((entry) => (
+            <span key={entry} className="cr-ops-active-tag">
+              {entry}
+            </span>
+          ))}
+        </div>
+      ) : null}
+
+      {overviewQuery.isPending && !hasOverviewData ? (
+        <LoadingBlock label="Employee tracking verisi hazırlanıyor..." />
+      ) : null}
+
+      {overviewQuery.isError && !hasOverviewData ? (
+        <section className="cr-ops-error">
+          <ErrorBlock message="Employee tracking overview verisi yüklenemedi." />
+          <button type="button" className="cr-ops-action" onClick={() => void overviewQuery.refetch()}>
+            Tekrar dene
+          </button>
+        </section>
+      ) : null}
+
+      {hasOverviewData && overview ? (
+        <>
+          <TrackingDashboard
+            summary={overview.summary}
+            liveCount={liveLocationCount}
+            markerCount={mapPoints.length}
+          />
+          {!isMobile ? (
+            <section className="cr-tracking-layout">
+              <aside className="cr-tracking-layout__list">
+                <EmployeeDailyRouteTable
+                  rows={dailyRows}
+                  selectedEmployeeId={selectedEmployeeId}
+                  selectedDay={selectedDay}
+                  loading={dailyRowsLoading}
+                  sortField={routeSort.field}
+                  sortDir={routeSort.dir}
+                  onSort={handleRouteSort}
+                  onSelectRow={handleSelectRow}
+                  onClearEmployee={() => {
+                    setSelectedEmployeeId(null)
+                    setSelectedDay(null)
+                    setSelectedEventId(null)
+                    setMapMode('fleet')
+                  }}
+                />
+              </aside>
+
+              <article className="cr-tracking-layout__map">
+                <section className="cr-ops-map-card">
+                  {mapHeader}
+                  {mapMode === 'employeeDay' ? (
+                    <SourceFilterBar
+                      options={SOURCE_OPTIONS}
+                      enabled={enabledSources}
+                      allSelected={allSourcesSelected}
+                      onSelectAll={() => setEnabledSources(ALL_SOURCES)}
+                      onToggle={handleToggleSource}
+                    />
+                  ) : null}
+                  <ControlRoomUnifiedMap
+                    mapMode={mapMode}
+                    selectedEmployeeId={selectedEmployeeId}
+                    selectedEmployeeName={selectedEmployeeState?.employee.full_name ?? null}
+                    selectedDay={selectedDay}
+                    overviewPoints={mapPoints}
+                    dayMapData={effectiveSelectedDayMapData}
+                    dayEvents={selectedDayEvents}
+                    dayLoading={selectedDayMapQuery.isFetching && !effectiveSelectedDayMapData}
+                    dayError={selectedDayMapQuery.isError}
+                    dayEventsLoading={selectedDayTimelineQuery.isFetching && !selectedDayEvents.length}
+                    dayEventsError={selectedDayTimelineQuery.isError}
+                    selectedEventId={selectedEventId}
+                    onSelectEmployee={handleSelectEmployee}
+                    onSelectEvent={setSelectedEventId}
+                  />
+                </section>
+              </article>
+            </section>
+          ) : mobileView === 'days' ? (
+            <EmployeeDailyRouteTable
+              rows={dailyRows}
+              selectedEmployeeId={selectedEmployeeId}
+              selectedDay={selectedDay}
+              loading={dailyRowsLoading}
+              mobile
+              onSelectRow={handleSelectRow}
+              onClearEmployee={() => {
+                setSelectedEmployeeId(null)
+                setSelectedDay(null)
+                setSelectedEventId(null)
+                setMapMode('fleet')
+              }}
+            />
+          ) : (
+            <section className="cr-ops-map-card">
+              {mapHeader}
+              {mapMode === 'employeeDay' ? (
+                <SourceFilterBar
+                  options={SOURCE_OPTIONS}
+                  enabled={enabledSources}
+                  allSelected={allSourcesSelected}
+                  onSelectAll={() => setEnabledSources(ALL_SOURCES)}
+                  onToggle={handleToggleSource}
+                />
+              ) : null}
+              <ControlRoomUnifiedMap
+                mapMode={mapMode}
+                selectedEmployeeId={selectedEmployeeId}
+                selectedEmployeeName={selectedEmployeeState?.employee.full_name ?? null}
+                selectedDay={selectedDay}
+                overviewPoints={mapPoints}
+                dayMapData={effectiveSelectedDayMapData}
+                dayEvents={selectedDayEvents}
+                dayLoading={selectedDayMapQuery.isFetching && !effectiveSelectedDayMapData}
+                dayError={selectedDayMapQuery.isError}
+                dayEventsLoading={selectedDayTimelineQuery.isFetching && !selectedDayEvents.length}
+                dayEventsError={selectedDayTimelineQuery.isError}
+                selectedEventId={selectedEventId}
+                onSelectEmployee={handleSelectEmployee}
+                onSelectEvent={setSelectedEventId}
+              />
+            </section>
+          )}
+        </>
+      ) : null}
+    </div>
+  )
+}

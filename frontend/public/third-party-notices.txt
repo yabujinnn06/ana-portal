@@ -1,0 +1,12 @@
+THIRD-PARTY VISUAL ASSETS
+
+Sea Blue Cursor Set
+Author: Daniel W. (dwanvig)
+Source: https://www.rw-designer.com/cursor-set/seablue
+License: Creative Commons Attribution
+Use: Original cursor artwork, with web-safe file names.
+
+File as Folders Icon Set
+Source: https://www.rw-designer.com/icon-set/file-as-folders
+License: Creative Commons Attribution-ShareAlike
+Use: Original icon artwork mechanically converted from ICO to transparent PNG for browser display.

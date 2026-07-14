@@ -1,0 +1,124 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rainwater}
+      POSTGRES_USER: ${POSTGRES_USER:-rainwater}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD zorunludur}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rainwater} -d ${POSTGRES_DB:-rainwater}"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+    networks: [data]
+
+  puantaj-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PUANTAJ_POSTGRES_DB:-puantaj}
+      POSTGRES_USER: ${PUANTAJ_POSTGRES_USER:-puantaj}
+      POSTGRES_PASSWORD: ${PUANTAJ_POSTGRES_PASSWORD:?PUANTAJ_POSTGRES_PASSWORD zorunludur}
+    volumes:
+      - puantaj_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PUANTAJ_POSTGRES_USER:-puantaj} -d ${PUANTAJ_POSTGRES_DB:-puantaj}"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+    networks: [puantaj_data]
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-rainwater}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-rainwater}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET zorunludur}
+      CORS_ORIGINS: ${PORTAL_ORIGIN:-https://portal.example.com}
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-portal.example.com,backend}
+      PLATFORM_HOSTS: ${PLATFORM_HOSTS:-portal.example.com}
+      AUTO_CREATE_SCHEMA: "false"
+      ENFORCE_CUSTOM_DOMAIN_BINDING: "true"
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-172.16.0.0/12}
+      BOOTSTRAP_TENANT_SLUG: ${BOOTSTRAP_TENANT_SLUG:-}
+      BOOTSTRAP_TENANT_NAME: ${BOOTSTRAP_TENANT_NAME:-}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+      PORTAL_PUBLIC_URL: ${PORTAL_ORIGIN:-https://portal.example.com}
+      MODULE_BRIDGE_SECRET: ${MODULE_BRIDGE_SECRET:?MODULE_BRIDGE_SECRET zorunludur}
+      PUANTAJ_PUBLIC_URL: ${PORTAL_ORIGIN:-https://portal.example.com}
+      PUANTAJ_INTERNAL_URL: http://puantaj:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [edge, data]
+
+  puantaj:
+    build: ./modules/puantaj
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+psycopg://${PUANTAJ_POSTGRES_USER:-puantaj}:${PUANTAJ_POSTGRES_PASSWORD}@puantaj-postgres:5432/${PUANTAJ_POSTGRES_DB:-puantaj}
+      JWT_SECRET: ${PUANTAJ_JWT_SECRET:?PUANTAJ_JWT_SECRET zorunludur}
+      JWT_ISSUER: rainwater-puantaj
+      JWT_AUDIENCE: rainwater-puantaj-admin
+      CORS_ALLOW_ORIGINS: ${PORTAL_ORIGIN:-https://portal.example.com}
+      TRUSTED_HOSTS: ${PUANTAJ_TRUSTED_HOSTS:-portal.example.com,puantaj,127.0.0.1}
+      BASE_PUBLIC_URL: ${PORTAL_ORIGIN:-https://portal.example.com}
+      WEBAUTHN_ORIGIN: ${PORTAL_ORIGIN:-https://portal.example.com}
+      WEBAUTHN_RP_ID: ${PUANTAJ_WEBAUTHN_RP_ID:-portal.example.com}
+      PORTAL_SSO_ENABLED: "true"
+      PORTAL_CONTROL_PLANE_URL: http://backend:8000
+      PORTAL_MODULE_BRIDGE_SECRET: ${MODULE_BRIDGE_SECRET:?MODULE_BRIDGE_SECRET zorunludur}
+      PORTAL_TENANT_SLUG: ${BOOTSTRAP_TENANT_SLUG:-rainwater}
+      RECOVERY_ADMIN_VAULT_KEY: ${PUANTAJ_RECOVERY_VAULT_KEY:-}
+      ARCHIVE_FILE_ENCRYPTION_KEY: ${PUANTAJ_ARCHIVE_ENCRYPTION_KEY:-}
+      DEPO_ADMIN_PIN: ${PUANTAJ_DEPO_ADMIN_PIN:-}
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-172.16.0.0/12}
+    depends_on:
+      puantaj-postgres:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+    networks: [edge, puantaj_data]
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    networks: [edge]
+
+  gateway:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [backend, frontend, puantaj]
+    networks: [edge]
+
+networks:
+  edge:
+  data:
+    internal: true
+  puantaj_data:
+    internal: true
+
+volumes:
+  postgres_data:
+  puantaj_postgres_data:
+  caddy_data:
+  caddy_config:

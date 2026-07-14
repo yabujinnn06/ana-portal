@@ -1,0 +1,920 @@
+import { useEffect, useMemo, useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link, useNavigate } from 'react-router-dom'
+import { z } from 'zod'
+
+import {
+  createEmployee,
+  deleteEmployee,
+  getDepartments,
+  getEmployees,
+  getRegions,
+  updateEmployeeActive,
+} from '../api/admin'
+import { apiClient } from '../api/client'
+import { parseApiError } from '../api/error'
+import { EmployeeAutocompleteField } from '../components/EmployeeAutocompleteField'
+import { ErrorBlock } from '../components/ErrorBlock'
+import { LoadingBlock } from '../components/LoadingBlock'
+import { PageHeader } from '../components/PageHeader'
+import { Panel } from '../components/Panel'
+import { StatusBadge } from '../components/StatusBadge'
+import { TableSearchInput } from '../components/TableSearchInput'
+import { useToast } from '../hooks/useToast'
+
+const employeeSchema = z.object({
+  full_name: z.string().min(2, 'Ad soyad en az 2 karakter olmalı.'),
+  region_id: z.union([z.coerce.number().int().positive(), z.null()]),
+  department_id: z.union([z.coerce.number().int().positive(), z.null()]),
+  is_active: z.boolean(),
+})
+
+const EMPLOYEE_LIST_PAGE_SIZES = [20, 35, 50, 100]
+const BULK_DEVICE_INVITE_MAX_MINUTES = 60 * 24 * 30
+const DEFAULT_BULK_DEVICE_INVITE_MINUTES = 60 * 24
+
+const bulkInviteSchema = z.object({
+  employee_ids: z.array(z.number().int().positive()).min(1, 'En az bir calisan secin.'),
+  expires_in_minutes: z.coerce.number().int().positive().max(BULK_DEVICE_INVITE_MAX_MINUTES),
+})
+
+type BulkDeviceInviteExportPayload = {
+  employee_ids: number[]
+  expires_in_minutes: number
+}
+
+function downloadBlob(blob: Blob, fileName: string): void {
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = fileName
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  URL.revokeObjectURL(url)
+}
+
+async function downloadBulkDeviceInviteExport(
+  payload: BulkDeviceInviteExportPayload,
+): Promise<Blob> {
+  const response = await apiClient.post<Blob>(
+    '/api/admin/device-invites/bulk-export.xlsx',
+    payload,
+    {
+      responseType: 'blob',
+    },
+  )
+  return response.data
+}
+
+export function EmployeesPage() {
+  const queryClient = useQueryClient()
+  const { pushToast } = useToast()
+  const navigate = useNavigate()
+  const [detailPickId, setDetailPickId] = useState('')
+
+  const [fullName, setFullName] = useState('')
+  const [regionId, setRegionId] = useState('')
+  const [departmentId, setDepartmentId] = useState('')
+  const [isActive, setIsActive] = useState(true)
+  const [searchTerm, setSearchTerm] = useState('')
+  const [isCreateOpen, setIsCreateOpen] = useState(false)
+  const [showInactive, setShowInactive] = useState(false)
+  const [regionFilterId, setRegionFilterId] = useState('')
+  const [departmentFilterId, setDepartmentFilterId] = useState('')
+  const [deviceStatusFilter, setDeviceStatusFilter] = useState<'' | 'none' | 'no_active'>('')
+  const [selectedEmployeeIds, setSelectedEmployeeIds] = useState<number[]>([])
+  const [bulkInviteMinutes, setBulkInviteMinutes] = useState(String(DEFAULT_BULK_DEVICE_INVITE_MINUTES))
+  const [employeeListPageSize, setEmployeeListPageSize] = useState(35)
+  const [employeeListPage, setEmployeeListPage] = useState(1)
+  const [error, setError] = useState<string | null>(null)
+
+  const employeesQuery = useQuery({
+    queryKey: ['employees', showInactive, regionFilterId, departmentFilterId, deviceStatusFilter],
+    queryFn: () =>
+      getEmployees({
+        ...(showInactive ? { include_inactive: true } : {}),
+        ...(regionFilterId ? { region_id: Number(regionFilterId) } : {}),
+        ...(departmentFilterId ? { department_id: Number(departmentFilterId) } : {}),
+        ...(deviceStatusFilter ? { device_status: deviceStatusFilter } : {}),
+      }),
+  })
+  const departmentsQuery = useQuery({ queryKey: ['departments'], queryFn: getDepartments })
+  const regionsQuery = useQuery({
+    queryKey: ['regions', 'employees-page'],
+    queryFn: () => getRegions({ include_inactive: true }),
+  })
+
+  const createMutation = useMutation({
+    mutationFn: createEmployee,
+    onSuccess: (employee) => {
+      setFullName('')
+      setRegionId('')
+      setDepartmentId('')
+      setIsActive(true)
+      setError(null)
+      setIsCreateOpen(false)
+      pushToast({
+        variant: 'success',
+        title: 'Çalışan oluşturuldu',
+        description: `${employee.full_name} başarıyla eklendi.`,
+      })
+      void queryClient.invalidateQueries({ queryKey: ['employees'] })
+    },
+    onError: (mutationError) => {
+      const message = parseApiError(mutationError, 'Çalışan oluşturulamadı.').message
+      setError(message)
+      pushToast({
+        variant: 'error',
+        title: 'Çalışan oluşturulamadı',
+        description: message,
+      })
+    },
+  })
+
+  const toggleActiveMutation = useMutation({
+    mutationFn: ({ employeeId, nextStatus }: { employeeId: number; nextStatus: boolean }) =>
+      updateEmployeeActive(employeeId, { is_active: nextStatus }),
+    onSuccess: (employee) => {
+      pushToast({
+        variant: 'success',
+        title: employee.is_active ? 'Çalışan arşivden çıkarıldı' : 'Çalışan arşivlendi',
+        description: `${employee.full_name} için durum güncellendi.`,
+      })
+      void queryClient.invalidateQueries({ queryKey: ['employees'] })
+    },
+    onError: (mutationError) => {
+      const message = parseApiError(mutationError, 'Çalışan durumu güncellenemedi.').message
+      pushToast({
+        variant: 'error',
+        title: 'İşlem başarısız',
+        description: message,
+      })
+    },
+  })
+
+  const deleteEmployeeMutation = useMutation({
+    mutationFn: (employeeId: number) => deleteEmployee(employeeId),
+    onSuccess: () => {
+      pushToast({
+        variant: 'success',
+        title: 'Çalışan kalıcı olarak silindi',
+        description: 'Arşivli çalışan kaydı sistemden kaldırıldı.',
+      })
+      void queryClient.invalidateQueries({ queryKey: ['employees'] })
+    },
+    onError: (mutationError) => {
+      const message = parseApiError(mutationError, 'Çalışan silinemedi.').message
+      pushToast({
+        variant: 'error',
+        title: 'Kalıcı silme başarısız',
+        description: message,
+      })
+    },
+  })
+
+  const bulkInviteExportMutation = useMutation({
+    mutationFn: downloadBulkDeviceInviteExport,
+    onSuccess: (blob) => {
+      downloadBlob(blob, `employee-claim-tokens-${Date.now()}.xlsx`)
+      pushToast({
+        variant: 'success',
+        title: 'Claim token Excel indirildi',
+        description: 'Secili calisanlar icin ayri tokenler uretildi ve Excel indirildi.',
+      })
+    },
+    onError: (mutationError) => {
+      pushToast({
+        variant: 'error',
+        title: 'Toplu claim token basarisiz',
+        description: parseApiError(mutationError, 'Claim token Excel dosyasi uretilemedi.').message,
+      })
+    },
+  })
+
+  const onSubmit = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setError(null)
+
+    const rawRegionId = regionId.trim() === '' ? null : Number(regionId)
+    const rawDepartmentId = departmentId.trim() === '' ? null : Number(departmentId)
+    const parsed = employeeSchema.safeParse({
+      full_name: fullName,
+      region_id: rawRegionId,
+      department_id: rawDepartmentId,
+      is_active: isActive,
+    })
+
+    if (!parsed.success) {
+      const message = parsed.error.issues[0]?.message ?? 'Çalışan formunu kontrol edin.'
+      setError(message)
+      pushToast({
+        variant: 'error',
+        title: 'Form hatası',
+        description: message,
+      })
+      return
+    }
+
+    createMutation.mutate(parsed.data)
+  }
+
+  const employees = useMemo(() => employeesQuery.data ?? [], [employeesQuery.data])
+  const departments = useMemo(() => departmentsQuery.data ?? [], [departmentsQuery.data])
+  const regions = useMemo(() => regionsQuery.data ?? [], [regionsQuery.data])
+  const departmentById = new Map(departments.map((department) => [department.id, department.name]))
+  const regionById = new Map(regions.map((region) => [region.id, region.name]))
+
+  const selectableDepartments = useMemo(() => {
+    const selectedRegion = regionId ? Number(regionId) : null
+    if (!selectedRegion) {
+      return departments
+    }
+    return departments.filter((department) => department.region_id === selectedRegion)
+  }, [departments, regionId])
+
+  const filterDepartments = useMemo(() => {
+    const selectedRegion = regionFilterId ? Number(regionFilterId) : null
+    if (!selectedRegion) {
+      return departments
+    }
+    return departments.filter((department) => department.region_id === selectedRegion)
+  }, [departments, regionFilterId])
+
+  const filteredEmployees = useMemo(() => {
+    const normalized = searchTerm.trim().toLowerCase()
+    if (!normalized) {
+      return employees
+    }
+    return employees.filter((employee) => employee.full_name.toLowerCase().includes(normalized))
+  }, [employees, searchTerm])
+  const activeEmployeeIds = useMemo(
+    () => new Set(employees.filter((employee) => employee.is_active).map((employee) => employee.id)),
+    [employees],
+  )
+  const selectedEmployeeIdSet = useMemo(() => new Set(selectedEmployeeIds), [selectedEmployeeIds])
+
+  const employeeListTotalPages = Math.max(1, Math.ceil(filteredEmployees.length / employeeListPageSize))
+  const safeEmployeeListPage = Math.min(employeeListPage, employeeListTotalPages)
+  const employeeListStartIndex = (safeEmployeeListPage - 1) * employeeListPageSize
+  const pagedEmployees = useMemo(
+    () => filteredEmployees.slice(employeeListStartIndex, employeeListStartIndex + employeeListPageSize),
+    [filteredEmployees, employeeListStartIndex, employeeListPageSize],
+  )
+  const employeeListRangeStart = filteredEmployees.length === 0 ? 0 : employeeListStartIndex + 1
+  const employeeListRangeEnd = filteredEmployees.length === 0
+    ? 0
+    : Math.min(employeeListStartIndex + employeeListPageSize, filteredEmployees.length)
+  const activeEmployeeCount = employees.filter((employee) => employee.is_active).length
+  const archivedEmployeeCount = employees.length - activeEmployeeCount
+  const filteredActiveCount = filteredEmployees.filter((employee) => employee.is_active).length
+  const filteredArchivedCount = filteredEmployees.length - filteredActiveCount
+  const coverageRegionCount = new Set(employees.filter((employee) => employee.region_id).map((employee) => employee.region_id)).size
+  const coverageDepartmentCount = new Set(
+    employees.filter((employee) => employee.department_id).map((employee) => employee.department_id),
+  ).size
+  const missingRegionCount = employees.filter((employee) => !employee.region_id).length
+  const missingDepartmentCount = employees.filter((employee) => !employee.department_id).length
+  const noDeviceCount = employees.filter(
+    (employee) => employee.is_active && (employee.device_count ?? 0) === 0,
+  ).length
+  const noActiveDeviceCount = employees.filter(
+    (employee) => employee.is_active && (employee.active_device_count ?? 0) === 0,
+  ).length
+  const activeFilteredEmployees = useMemo(
+    () => filteredEmployees.filter((employee) => employee.is_active),
+    [filteredEmployees],
+  )
+  const noActiveDeviceFilteredEmployees = useMemo(
+    () => activeFilteredEmployees.filter((employee) => (employee.active_device_count ?? 0) === 0),
+    [activeFilteredEmployees],
+  )
+  const activePagedEmployees = useMemo(
+    () => pagedEmployees.filter((employee) => employee.is_active),
+    [pagedEmployees],
+  )
+  const selectedEmployeeCount = selectedEmployeeIds.length
+  const allPagedActiveSelected = activePagedEmployees.length > 0
+    && activePagedEmployees.every((employee) => selectedEmployeeIdSet.has(employee.id))
+  const allFilteredActiveSelected = activeFilteredEmployees.length > 0
+    && activeFilteredEmployees.every((employee) => selectedEmployeeIdSet.has(employee.id))
+
+  const resetEmployeePagination = () => setEmployeeListPage(1)
+
+  useEffect(() => {
+    setSelectedEmployeeIds((previous) => previous.filter((employeeId) => activeEmployeeIds.has(employeeId)))
+  }, [activeEmployeeIds])
+
+  const toggleEmployeeSelection = (employeeId: number) => {
+    setSelectedEmployeeIds((previous) =>
+      previous.includes(employeeId)
+        ? previous.filter((value) => value !== employeeId)
+        : [...previous, employeeId],
+    )
+  }
+
+  const mergeSelectedEmployees = (employeeIds: number[]) => {
+    setSelectedEmployeeIds((previous) => Array.from(new Set([...previous, ...employeeIds])))
+  }
+
+  const removeSelectedEmployees = (employeeIds: number[]) => {
+    const idsToRemove = new Set(employeeIds)
+    setSelectedEmployeeIds((previous) => previous.filter((employeeId) => !idsToRemove.has(employeeId)))
+  }
+
+  const handleTogglePagedEmployees = () => {
+    const pagedActiveIds = activePagedEmployees.map((employee) => employee.id)
+    if (pagedActiveIds.length === 0) {
+      return
+    }
+    if (allPagedActiveSelected) {
+      removeSelectedEmployees(pagedActiveIds)
+      return
+    }
+    mergeSelectedEmployees(pagedActiveIds)
+  }
+
+  const handleSelectFilteredEmployees = () => {
+    const filteredActiveIds = activeFilteredEmployees.map((employee) => employee.id)
+    if (filteredActiveIds.length === 0) {
+      return
+    }
+    if (allFilteredActiveSelected) {
+      removeSelectedEmployees(filteredActiveIds)
+      return
+    }
+    mergeSelectedEmployees(filteredActiveIds)
+  }
+
+  const handleSelectNoActiveDeviceEmployees = () => {
+    const ids = noActiveDeviceFilteredEmployees.map((employee) => employee.id)
+    if (ids.length === 0) {
+      return
+    }
+    mergeSelectedEmployees(ids)
+  }
+
+  const handleBulkInviteExport = () => {
+    const parsed = bulkInviteSchema.safeParse({
+      employee_ids: selectedEmployeeIds,
+      expires_in_minutes: bulkInviteMinutes,
+    })
+    if (!parsed.success) {
+      const message = parsed.error.issues[0]?.message ?? 'Toplu claim token formunu kontrol edin.'
+      pushToast({
+        variant: 'error',
+        title: 'Form hatasi',
+        description: message,
+      })
+      return
+    }
+
+    const confirmed = window.confirm(
+      `Secili ${parsed.data.employee_ids.length} calisan icin ayri claim token uretilecek ve Excel indirilecek. Devam edilsin mi?`,
+    )
+    if (!confirmed) {
+      return
+    }
+
+    bulkInviteExportMutation.mutate(parsed.data)
+  }
+
+  if (employeesQuery.isLoading || departmentsQuery.isLoading || regionsQuery.isLoading) {
+    return <LoadingBlock />
+  }
+
+  if (employeesQuery.isError || departmentsQuery.isError || regionsQuery.isError) {
+    return <ErrorBlock message="Çalışan verileri alınamadı." />
+  }
+
+  return (
+    <div className="space-y-5">
+      <PageHeader
+        title="Çalışanlar"
+        description="Çalışan kadrosunu tek ekranda filtreleyin, eksik atamaları görün ve profil akışını hızla yönetin."
+        action={
+          <button
+            type="button"
+            onClick={() => setIsCreateOpen((prev) => !prev)}
+            className="btn-primary rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700"
+          >
+            {isCreateOpen ? 'Formu Kapat' : 'Yeni Çalışan'}
+          </button>
+        }
+      />
+
+      <Panel>
+        <div className="flex flex-col gap-3 border-b border-slate-100 pb-4 sm:flex-row sm:items-end sm:justify-between">
+          <div className="w-full sm:max-w-md">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-500">Çalışan Detayına Git</p>
+            <p className="mt-0.5 text-xs text-slate-500">
+              Ad veya ID ile seç, detay sayfasını aç. Listedeki "Düzenle" de aynı sayfaya gider.
+            </p>
+          </div>
+          <div className="flex w-full items-center gap-2 sm:w-auto">
+            <div className="w-full sm:w-64">
+              <EmployeeAutocompleteField
+                label=""
+                employees={employees}
+                value={detailPickId || (employees[0] ? String(employees[0].id) : '')}
+                onChange={setDetailPickId}
+                placeholder="Çalışan ara..."
+                emptyLabel="Çalışan ara..."
+                labelClassName="block"
+                labelTextClassName="sr-only"
+                inputClassName="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              />
+            </div>
+            <button
+              type="button"
+              disabled={employees.length === 0}
+              onClick={() => {
+                const target = detailPickId || (employees[0] ? String(employees[0].id) : '')
+                if (target) navigate(`/employees/${target}`)
+              }}
+              className="shrink-0 rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-60"
+            >
+              Detay Aç
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <div className="rounded-xl border border-slate-200 bg-white p-4">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Toplam kadro</p>
+            <p className="mt-3 text-2xl font-semibold tracking-tight text-slate-950">{employees.length}</p>
+            <p className="mt-1 text-sm text-slate-600">{activeEmployeeCount} aktif, {archivedEmployeeCount} arşiv</p>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white p-4">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Filtre görünümü</p>
+            <p className="mt-3 text-2xl font-semibold tracking-tight text-slate-950">{filteredEmployees.length}</p>
+            <p className="mt-1 text-sm text-slate-600">{filteredActiveCount} aktif, {filteredArchivedCount} arşiv satırı</p>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white p-4">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Kapsam</p>
+            <p className="mt-3 text-2xl font-semibold tracking-tight text-slate-950">{coverageRegionCount}</p>
+            <p className="mt-1 text-sm text-slate-600">{coverageDepartmentCount} departman aktif görünüyor</p>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white p-4">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Atama açığı</p>
+            <p className="mt-3 text-2xl font-semibold tracking-tight text-slate-950">{missingDepartmentCount}</p>
+            <p className="mt-1 text-sm text-slate-600">{missingRegionCount} çalışanda bölge ataması eksik</p>
+          </div>
+        </div>
+      </Panel>
+
+      {isCreateOpen ? (
+        <Panel>
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h4 className="text-base font-semibold text-slate-900">Yeni çalışan oluştur</h4>
+              <p className="mt-1 text-xs text-slate-500">
+                Listeyi terk etmeden yeni kayıt açın; bölge ve departman seçimiyle daha temiz bir başlangıç yapın.
+              </p>
+            </div>
+            <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-medium text-slate-600">
+              Hızlı kayıt
+            </span>
+          </div>
+          <form onSubmit={onSubmit} className="mt-4 grid gap-3 md:grid-cols-5">
+            <label className="text-sm text-slate-700 md:col-span-2">
+              Ad Soyad
+              <input
+                value={fullName}
+                onChange={(event) => setFullName(event.target.value)}
+                className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2.5"
+                placeholder="Ada Lovelace"
+              />
+            </label>
+
+            <label className="text-sm text-slate-700">
+              Bölge
+              <select
+                value={regionId}
+                onChange={(event) => {
+                  setRegionId(event.target.value)
+                  setDepartmentId('')
+                }}
+                className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2.5"
+              >
+                <option value="">Atanmamış</option>
+                {regions.map((region) => (
+                  <option key={region.id} value={region.id}>
+                    {region.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="text-sm text-slate-700">
+              Departman
+              <select
+                value={departmentId}
+                onChange={(event) => setDepartmentId(event.target.value)}
+                className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2.5"
+              >
+                <option value="">Atanmamış</option>
+                {selectableDepartments.map((department) => (
+                  <option key={department.id} value={department.id}>
+                    {department.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="flex items-center gap-2 pt-7 text-sm text-slate-700">
+              <input
+                type="checkbox"
+                checked={isActive}
+                onChange={(event) => setIsActive(event.target.checked)}
+              />
+              Aktif
+            </label>
+
+            <div className="flex gap-2 md:col-span-5">
+              <button
+                type="submit"
+                disabled={createMutation.isPending}
+                className="btn-primary rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-60"
+              >
+                {createMutation.isPending ? 'Kaydediliyor...' : 'Kaydet'}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsCreateOpen(false)
+                  setError(null)
+                }}
+                className="btn-secondary rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                Vazgeç
+              </button>
+            </div>
+          </form>
+          {error ? <div className="form-validation">{error}</div> : null}
+        </Panel>
+      ) : null}
+
+      <Panel>
+        <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h4 className="text-base font-semibold text-slate-900">Liste görünümü</h4>
+            <p className="mt-1 text-xs text-slate-500">
+              Filtreler, eksik atamalar ve arşiv görünümü tek akışta toplandı.
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2 text-xs text-slate-600">
+            <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1">Sayfa {safeEmployeeListPage} / {employeeListTotalPages}</span>
+            <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1">{filteredEmployees.length} sonuç</span>
+          </div>
+        </div>
+
+        <div className="mb-4 grid gap-3 md:grid-cols-6">
+          <TableSearchInput
+            value={searchTerm}
+            onChange={(value) => {
+              setSearchTerm(value)
+              resetEmployeePagination()
+            }}
+            placeholder="Çalışan adına göre ara..."
+          />
+          <label className="text-sm text-slate-700">
+            Cihaz durumu
+            <select
+              value={deviceStatusFilter}
+              onChange={(event) => {
+                setDeviceStatusFilter(event.target.value as '' | 'none' | 'no_active')
+                resetEmployeePagination()
+              }}
+              className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
+            >
+              <option value="">Tümü</option>
+              <option value="no_active">Aktif cihazı yok (kurulum gerekli)</option>
+              <option value="none">Hiç cihazı yok</option>
+            </select>
+          </label>
+          <label className="text-sm text-slate-700">
+            Bölge filtresi
+            <select
+              value={regionFilterId}
+              onChange={(event) => {
+                setRegionFilterId(event.target.value)
+                setDepartmentFilterId('')
+                resetEmployeePagination()
+              }}
+              className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
+            >
+              <option value="">Tüm bölgeler</option>
+              {regions.map((region) => (
+                <option key={region.id} value={region.id}>
+                  {region.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="text-sm text-slate-700">
+            Departman filtresi
+            <select
+              value={departmentFilterId}
+              onChange={(event) => {
+                setDepartmentFilterId(event.target.value)
+                resetEmployeePagination()
+              }}
+              className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
+            >
+              <option value="">Tüm departmanlar</option>
+              {filterDepartments.map((department) => (
+                <option key={department.id} value={department.id}>
+                  {department.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="inline-flex items-center gap-2 pt-8 text-sm text-slate-700">
+            <input
+              type="checkbox"
+              checked={showInactive}
+              onChange={(event) => {
+                setShowInactive(event.target.checked)
+                resetEmployeePagination()
+              }}
+            />
+            Arşivdekileri göster
+          </label>
+        </div>
+
+        <div className="mb-4 grid gap-3 md:grid-cols-4">
+          <div className="rounded-2xl border border-slate-200 bg-slate-50/80 px-4 py-3">
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Gösterim</p>
+            <p className="mt-2 text-sm text-slate-700">
+              Satır aralığı: {employeeListRangeStart}-{employeeListRangeEnd} / {filteredEmployees.length}
+            </p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-slate-50/80 px-4 py-3">
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Atama açığı</p>
+            <p className="mt-2 text-sm text-slate-700">
+              {missingDepartmentCount} departman eksik, {missingRegionCount} bölge eksik
+            </p>
+          </div>
+          <div className="rounded-2xl border border-amber-200 bg-amber-50/80 px-4 py-3">
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-amber-700">Cihaz kurulumu gerekli</p>
+            <p className="mt-2 text-sm text-amber-900">
+              {noActiveDeviceCount} aktif çalışanda aktif cihaz yok ({noDeviceCount} hiç cihaz eklememiş)
+            </p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-slate-50/80 px-4 py-3">
+            <label className="inline-flex items-center gap-2 text-sm text-slate-700">
+              Sayfa başı
+              <select
+                value={employeeListPageSize}
+                onChange={(event) => {
+                  setEmployeeListPageSize(Number(event.target.value))
+                  resetEmployeePagination()
+                }}
+                className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-800"
+              >
+                {EMPLOYEE_LIST_PAGE_SIZES.map((size) => (
+                  <option key={size} value={size}>
+                    {size}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div className="mb-4 rounded-2xl border border-emerald-200 bg-emerald-50/70 px-4 py-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-emerald-700">Toplu claim token</p>
+              <p className="mt-1 text-sm text-emerald-950">
+                Secili her calisan icin ayri token uretir ve tek bir Excel dosyasinda indirir.
+              </p>
+              <p className="mt-1 text-xs text-emerald-800">
+                Secili: {selectedEmployeeCount} calisan | Filtrede aktif: {activeFilteredEmployees.length}
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={handleSelectFilteredEmployees}
+                className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-semibold text-emerald-800 hover:bg-emerald-100"
+              >
+                {allFilteredActiveSelected ? 'Filtre secimini kaldir' : 'Filtredeki aktifleri sec'}
+              </button>
+              <button
+                type="button"
+                onClick={handleSelectNoActiveDeviceEmployees}
+                disabled={noActiveDeviceFilteredEmployees.length === 0}
+                className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-800 hover:bg-amber-100 disabled:opacity-50"
+                title="Filtredeki, aktif cihazi olmayan calisanlari secime ekler"
+              >
+                Aktif cihazi olmayanlari sec ({noActiveDeviceFilteredEmployees.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedEmployeeIds([])}
+                disabled={selectedEmployeeCount === 0}
+                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+              >
+                Secimi temizle
+              </button>
+            </div>
+          </div>
+
+          <div className="mt-4 flex flex-wrap items-end gap-3">
+            <label className="text-sm text-slate-700">
+              Claim suresi (dakika)
+              <input
+                type="number"
+                min={1}
+                max={BULK_DEVICE_INVITE_MAX_MINUTES}
+                step={1}
+                value={bulkInviteMinutes}
+                onChange={(event) => setBulkInviteMinutes(event.target.value)}
+                className="mt-1 w-40 rounded-lg border border-emerald-300 bg-white px-3 py-2"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={handleBulkInviteExport}
+              disabled={selectedEmployeeCount === 0 || bulkInviteExportMutation.isPending}
+              className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-800 disabled:opacity-60"
+            >
+              {bulkInviteExportMutation.isPending
+                ? 'Excel hazirlaniyor...'
+                : 'Secili calisanlara token uret ve Excel indir'}
+            </button>
+            <p className="text-xs text-slate-600">Ornek: 1440 = 1 gun, 10080 = 7 gun, 43200 = 30 gun.</p>
+          </div>
+        </div>
+
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-600">
+          <p>
+            Görünen aktif kayıt: {filteredActiveCount}
+          </p>
+          <p>Arşiv görünümü: {showInactive ? 'Açık' : 'Kapalı'}</p>
+        </div>
+
+        <div className="list-scroll-area w-full max-w-full overflow-x-auto">
+          <table className="min-w-full text-left text-sm">
+            <thead className="text-xs uppercase text-slate-500">
+              <tr>
+                <th className="py-2">Çalışan</th>
+                <th className="py-2">
+                  <input
+                    type="checkbox"
+                    checked={allPagedActiveSelected}
+                    onChange={handleTogglePagedEmployees}
+                    disabled={activePagedEmployees.length === 0}
+                    aria-label="Sayfadaki aktif calisanlari sec"
+                  />
+                </th>
+                <th className="py-2">Kapsam</th>
+                <th className="py-2">Durum</th>
+                <th className="py-2">Not</th>
+                <th className="py-2">İşlem</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pagedEmployees.map((employee) => (
+                <tr key={employee.id} className="border-t border-slate-100">
+                  <td className="py-2">
+                    <div className="min-w-[220px]">
+                      <p className="font-semibold text-slate-900">{employee.full_name}</p>
+                      <p className="text-xs text-slate-500">ID #{employee.id}</p>
+                    </div>
+                  </td>
+                  <td className="py-2 align-top">
+                    <input
+                      type="checkbox"
+                      checked={selectedEmployeeIdSet.has(employee.id)}
+                      onChange={() => toggleEmployeeSelection(employee.id)}
+                      disabled={!employee.is_active}
+                      aria-label={`${employee.full_name} sec`}
+                    />
+                  </td>
+                  <td className="py-2">
+                    <div className="space-y-1 text-sm text-slate-600">
+                      <p>Bölge: {employee.region_name ?? (employee.region_id ? regionById.get(employee.region_id) : '-') ?? 'Atanmamış'}</p>
+                      <p>Departman: {employee.department_id ? departmentById.get(employee.department_id) : 'Atanmamış'}</p>
+                      <p>
+                        Cihaz:{' '}
+                        {(employee.active_device_count ?? 0) > 0 ? (
+                          <span className="text-emerald-700">{employee.active_device_count} aktif</span>
+                        ) : (employee.device_count ?? 0) > 0 ? (
+                          <span className="font-semibold text-amber-700">cihaz var, aktif değil</span>
+                        ) : (
+                          <span className="font-semibold text-red-700">cihaz yok</span>
+                        )}
+                      </p>
+                    </div>
+                  </td>
+                  <td className="py-2">
+                    <div className="space-y-2">
+                      <StatusBadge value={employee.is_active ? 'Aktif' : 'Pasif'} />
+                      <p className="text-xs text-slate-500">
+                        {employee.region_id && employee.department_id ? 'Atama tamam' : 'Atama gözden geçirilmeli'}
+                      </p>
+                    </div>
+                  </td>
+                  <td className="py-2">
+                    <span className={`inline-flex rounded-full border px-3 py-1 text-xs font-medium ${
+                      employee.region_id && employee.department_id
+                        ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                        : 'border-amber-200 bg-amber-50 text-amber-700'
+                    }`}>
+                      {employee.region_id && employee.department_id ? 'Düzenli profil' : 'Eksik profil'}
+                    </span>
+                  </td>
+                  <td className="py-2">
+                    <div className="flex flex-wrap gap-2">
+                      <Link
+                        to={`/employees/${employee.id}`}
+                        className="employee-action-btn employee-action-edit"
+                      >
+                        Düzenle
+                      </Link>
+                      <button
+                        type="button"
+                        disabled={toggleActiveMutation.isPending}
+                        onClick={() => {
+                          const nextStatus = !employee.is_active
+                          const confirmed = window.confirm(
+                            nextStatus
+                              ? `${employee.full_name} arşivden çıkarılsın mı?`
+                              : `${employee.full_name} arşivlensin mi?`,
+                          )
+                          if (!confirmed) {
+                            return
+                          }
+                          toggleActiveMutation.mutate({
+                            employeeId: employee.id,
+                            nextStatus,
+                          })
+                        }}
+                        className={`employee-action-btn ${
+                          employee.is_active
+                            ? 'employee-action-archive'
+                            : 'employee-action-restore'
+                        }`}
+                      >
+                        {employee.is_active ? 'Arşivle' : 'Arşivden Çıkar'}
+                      </button>
+                      {!employee.is_active ? (
+                        <button
+                          type="button"
+                          disabled={deleteEmployeeMutation.isPending}
+                          onClick={() => {
+                            const confirmed = window.confirm(
+                              `${employee.full_name} kalıcı olarak silinsin mi? Bu işlem bağlı cihaz ve eski kayıtları da veritabanından kaldırabilir.`,
+                            )
+                            if (!confirmed) {
+                              return
+                            }
+                            deleteEmployeeMutation.mutate(employee.id)
+                          }}
+                          className="employee-action-btn employee-action-delete"
+                        >
+                          Kalıcı Sil
+                        </button>
+                      ) : null}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="mt-3 flex items-center justify-between">
+          <p className="text-xs text-slate-500">
+            Sayfa {safeEmployeeListPage} / {employeeListTotalPages}
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setEmployeeListPage((prev) => Math.max(1, prev - 1))}
+              disabled={safeEmployeeListPage <= 1}
+              className="rounded-md border border-slate-300 px-2 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+            >
+              Önceki
+            </button>
+            <button
+              type="button"
+              onClick={() => setEmployeeListPage((prev) => Math.min(employeeListTotalPages, prev + 1))}
+              disabled={safeEmployeeListPage >= employeeListTotalPages}
+              className="rounded-md border border-slate-300 px-2 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+            >
+              Sonraki
+            </button>
+          </div>
+        </div>
+
+        {filteredEmployees.length === 0 ? (
+          <p className="mt-3 text-sm text-slate-500">Arama kriterine uygun çalışan bulunamadı.</p>
+        ) : null}
+      </Panel>
+    </div>
+  )
+}

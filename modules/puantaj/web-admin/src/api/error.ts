@@ -1,0 +1,81 @@
+import axios from 'axios'
+
+import type { ApiErrorShape } from '../types/api'
+
+export interface ParsedApiError {
+  code?: string
+  message: string
+  requestId?: string
+}
+
+const codeMessageMap: Record<string, string> = {
+  INVALID_CREDENTIALS: 'Kullanıcı adi veya şifre hatali.',
+  TOO_MANY_ATTEMPTS: 'Çok fazla deneme yaptınız. Lütfen daha sonra tekrar deneyin.',
+  INVALID_TOKEN: 'Oturum geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.',
+  FORBIDDEN: 'Bu işlem için yetkiniz yok.',
+  INTERNAL_ERROR: 'Sunucu hatası oluştu. Lütfen tekrar deneyin.',
+  MFA_REQUIRED: 'MFA kodu zorunlu. Authenticator kodunu girin.',
+  INVALID_MFA_CODE: 'MFA kodu geçersiz. Tekrar deneyin.',
+  MFA_SETUP_REQUIRED: 'Bu hesap için MFA kurulumu tamamlanmamış.',
+  MFA_SETUP_NOT_STARTED: 'Once MFA kurulumunu baslatin.',
+  MFA_NOT_ENABLED: 'Bu hesapta MFA aktif değil.',
+  ARCHIVE_DECRYPT_FAILED: 'Arşiv dosyasi acilamadi. Sunucu anahtarini kontrol edin.',
+  EXTRA_CHECKIN_APPROVAL_NOT_FOUND: 'Ek giriş onay talebi bulunamadı.',
+  EXTRA_CHECKIN_APPROVAL_EXPIRED: 'Ek giriş onay talebinin süresi dolmuş.',
+  INVITE_ATTEMPTS_EXCEEDED: 'Davet linkinin deneme limiti doldu. Yeni bir link uretin.',
+  INVITE_CONTEXT_MISMATCH: 'Davet linki aynı cihaz/tarayıcı bağlamında kullanılmalıdır.',
+  INVITE_RETRY_TOO_FAST: 'Çok hızlı deneme yaptınız. Birkaç saniye bekleyip tekrar deneyin.',
+  INVITE_TTL_TOO_LONG: 'Davet süresi izin verilen limiti asiyor.',
+  ADMIN_PUSH_SUBSCRIPTION_REQUIRED: 'Aktif admin push aboneligi yok. Önce bir admin cihazi claim edilmelidir.',
+  EMPLOYEE_ACTIVE_DELETE_FORBIDDEN: 'Aktif çalışan silinemez. Once arsivleyin.',
+  DEVICE_ACTIVE_DELETE_FORBIDDEN: 'Aktif cihaz silinemez. Önce pasife alın.',
+}
+
+export function parseApiError(error: unknown, fallback: string): ParsedApiError {
+  if (axios.isAxiosError(error)) {
+    const data = error.response?.data as ApiErrorShape | string | undefined
+    if (typeof data === 'string') {
+      return { message: data }
+    }
+
+    const code = data?.error?.code
+    const requestId = data?.error?.request_id
+    const backendMessage = data?.error?.message
+
+    if (code && codeMessageMap[code]) {
+      return {
+        code,
+        requestId,
+        message: codeMessageMap[code],
+      }
+    }
+
+    if (backendMessage) {
+      return {
+        code,
+        requestId,
+        message: backendMessage,
+      }
+    }
+
+    if (error.message) {
+      return {
+        message: error.message,
+      }
+    }
+  }
+
+  if (error instanceof Error && error.message) {
+    return {
+      message: error.message,
+    }
+  }
+
+  return {
+    message: fallback,
+  }
+}
+
+export function getApiErrorMessage(error: unknown, fallback: string): string {
+  return parseApiError(error, fallback).message
+}

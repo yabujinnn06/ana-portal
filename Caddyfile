@@ -1,0 +1,35 @@
+{
+  on_demand_tls {
+    ask http://backend:8000/internal/caddy/allow
+  }
+}
+
+https:// {
+  tls {
+    on_demand
+  }
+  encode zstd gzip
+
+  @puantaj path /admin-panel /admin-panel/* /employee /employee/* /depo /depo/* /api/admin /api/admin/* /api/attendance /api/attendance/* /api/device /api/device/* /api/employee /api/employee/* /api/depo /api/depo/* /api/portal-sso /api/portal-sso/*
+  handle @puantaj {
+    reverse_proxy puantaj:8000
+  }
+
+  @api path /api/* /health
+  handle @api {
+    reverse_proxy backend:8000
+  }
+
+  handle {
+    reverse_proxy frontend:80
+  }
+
+  header {
+    X-Content-Type-Options nosniff
+    X-Frame-Options DENY
+    Referrer-Policy strict-origin-when-cross-origin
+    Permissions-Policy "camera=(self), microphone=(), geolocation=(self)"
+    Content-Security-Policy "default-src 'self'; connect-src 'self' wss: https://nominatim.openstreetmap.org https://*.tile.openstreetmap.org https://tiles.openfreemap.org; img-src 'self' data: blob: https://*.tile.openstreetmap.org https://tile.openstreetmap.org https://tiles.openfreemap.org; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com https://tiles.openfreemap.org; worker-src 'self' blob:; manifest-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https:; object-src 'none'"
+    -Server
+  }
+}

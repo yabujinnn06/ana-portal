@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -10,6 +11,10 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def new_uuid() -> str:
+    return str(uuid4())
 
 
 class Base(DeclarativeBase):
@@ -205,5 +210,162 @@ class AuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
 
 
+class Tenant(TimestampMixin, Base):
+    __tablename__ = "tenants"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    slug: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(180))
+    status: Mapped[str] = mapped_column(String(24), default="TRIAL", index=True)
+    billing_email: Mapped[str | None] = mapped_column(String(254))
+    data_region: Mapped[str] = mapped_column(String(20), default="TR")
+    locale: Mapped[str] = mapped_column(String(20), default="tr-TR")
+    timezone: Mapped[str] = mapped_column(String(64), default="Europe/Istanbul")
+    settings: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class PlatformUser(TimestampMixin, Base):
+    __tablename__ = "platform_users"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    email: Mapped[str] = mapped_column(String(254), unique=True, index=True)
+    full_name: Mapped[str] = mapped_column(String(160))
+    password_hash: Mapped[str] = mapped_column(String(255))
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    platform_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    token_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class TenantMembership(TimestampMixin, Base):
+    __tablename__ = "tenant_memberships"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("platform_users.id", ondelete="CASCADE"), index=True)
+    role: Mapped[str] = mapped_column(String(32), default="MEMBER")
+    permissions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    __table_args__ = (UniqueConstraint("tenant_id", "user_id", name="uq_membership_tenant_user"),)
+
+
+class SaaSModule(TimestampMixin, Base):
+    __tablename__ = "saas_modules"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    code: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    description: Mapped[str] = mapped_column(String(320))
+    category: Mapped[str] = mapped_column(String(64))
+    monthly_price: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
+    currency: Mapped[str] = mapped_column(String(3), default="TRY")
+    core: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class SaaSPlan(TimestampMixin, Base):
+    __tablename__ = "saas_plans"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    code: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    description: Mapped[str] = mapped_column(String(320))
+    monthly_base_price: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
+    currency: Mapped[str] = mapped_column(String(3), default="TRY")
+    included_users: Mapped[int] = mapped_column(Integer, default=5)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class PlanModule(Base):
+    __tablename__ = "plan_modules"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    plan_id: Mapped[str] = mapped_column(ForeignKey("saas_plans.id", ondelete="CASCADE"), index=True)
+    module_id: Mapped[str] = mapped_column(ForeignKey("saas_modules.id", ondelete="CASCADE"), index=True)
+    __table_args__ = (UniqueConstraint("plan_id", "module_id", name="uq_plan_module"),)
+
+
+class TenantSubscription(TimestampMixin, Base):
+    __tablename__ = "tenant_subscriptions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), unique=True, index=True)
+    plan_id: Mapped[str] = mapped_column(ForeignKey("saas_plans.id"), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="TRIALING", index=True)
+    trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    current_period_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    external_billing_id: Mapped[str | None] = mapped_column(String(160))
+
+
+class TenantModuleEntitlement(TimestampMixin, Base):
+    __tablename__ = "tenant_module_entitlements"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    module_id: Mapped[str] = mapped_column(ForeignKey("saas_modules.id", ondelete="CASCADE"), index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    monthly_price_override: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source: Mapped[str] = mapped_column(String(32), default="ADMIN")
+    __table_args__ = (UniqueConstraint("tenant_id", "module_id", name="uq_tenant_module_entitlement"),)
+
+
+class TenantModuleDeployment(TimestampMixin, Base):
+    __tablename__ = "tenant_module_deployments"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    module_id: Mapped[str] = mapped_column(ForeignKey("saas_modules.id", ondelete="CASCADE"), index=True)
+    deployment_mode: Mapped[str] = mapped_column(String(24), default="DEDICATED")
+    public_url: Mapped[str] = mapped_column(String(500))
+    internal_url: Mapped[str | None] = mapped_column(String(500))
+    status: Mapped[str] = mapped_column(String(24), default="PROVISIONING", index=True)
+    last_health_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[str | None] = mapped_column(String(64))
+    __table_args__ = (UniqueConstraint("tenant_id", "module_id", name="uq_tenant_module_deployment"),)
+
+
+class ModuleLaunchTicket(Base):
+    __tablename__ = "module_launch_tickets"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("platform_users.id", ondelete="CASCADE"), index=True)
+    module_id: Mapped[str] = mapped_column(ForeignKey("saas_modules.id", ondelete="CASCADE"), index=True)
+    ticket_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class TenantDomain(TimestampMixin, Base):
+    __tablename__ = "tenant_domains"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    hostname: Mapped[str] = mapped_column(String(253), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(24), default="PENDING", index=True)
+    verification_token_hash: Mapped[str] = mapped_column(String(64))
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AuthenticationAttempt(Base):
+    __tablename__ = "authentication_attempts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_slug: Mapped[str] = mapped_column(String(64), index=True)
+    email: Mapped[str] = mapped_column(String(254), index=True)
+    ip_address: Mapped[str] = mapped_column(String(64))
+    success: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+
+
+class SecurityAuditEvent(Base):
+    __tablename__ = "security_audit_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str | None] = mapped_column(ForeignKey("tenants.id", ondelete="SET NULL"), index=True)
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("platform_users.id", ondelete="SET NULL"), index=True)
+    action: Mapped[str] = mapped_column(String(100), index=True)
+    resource: Mapped[str | None] = mapped_column(String(180))
+    request_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    ip_address: Mapped[str | None] = mapped_column(String(64))
+    user_agent: Mapped[str | None] = mapped_column(String(500))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+
+
 Index("ix_movement_line_product_lot", StockMovementLine.product_id, StockMovementLine.lot_no)
 Index("ix_count_line_session_product", CountLine.session_id, CountLine.product_id)
+Index("ix_auth_attempt_lookup", AuthenticationAttempt.tenant_slug, AuthenticationAttempt.email, AuthenticationAttempt.ip_address, AuthenticationAttempt.created_at)
+Index("ix_security_audit_tenant_created", SecurityAuditEvent.tenant_id, SecurityAuditEvent.created_at)
+Index("ix_module_launch_expiry", ModuleLaunchTicket.expires_at, ModuleLaunchTicket.consumed_at)

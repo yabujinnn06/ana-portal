@@ -1,0 +1,702 @@
+import asyncio
+from contextlib import suppress
+from datetime import datetime, timezone
+import logging
+import time
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+from uuid import uuid4
+
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.errors import ApiError, error_response
+from app.logging_utils import setup_json_logging
+from app.middleware import PortalTenantHostMiddleware
+from app.routers import admin, assistant, attendance, ozluk, payroll, portal_sso
+from app.routers import depo_portal, depo_yonetim
+from app.routers.depo import router as depo_router
+from app.settings import get_cors_origins, get_settings
+from app.services.notifications import (
+    get_daily_report_job_health,
+    get_notification_channel_health,
+    repair_auto_midnight_checkout_events,
+    schedule_daily_admin_report_archive_notifications,
+    schedule_missing_checkin_notifications,
+    schedule_missed_checkout_notifications,
+    send_pending_notifications,
+)
+from app.services.notification_tasks import enqueue_due_scheduled_notification_tasks
+from app.services.notifications_alerts import dispatch_daily_report_alarm
+from app.services.push_notifications import run_admin_push_claim_health_check
+from app.services.schema_guard import (
+    SchemaGuardResult,
+    schema_issues_all_transient,
+    verify_runtime_schema,
+)
+from app.services.breaks import check_break_over_limits
+from app.services.demo_notifications import schedule_demo_monitor_notifications
+from app.services.depo_auth import hash_pin as depo_hash_pin
+from app.db import Base, SessionLocal, engine
+from app.models import DepoUser
+
+setup_json_logging()
+logger = logging.getLogger("app.request")
+notification_worker_logger = logging.getLogger("app.notification_worker")
+settings = get_settings()
+settings.validate_runtime()
+
+# Tokens would otherwise be signed with the empty default secret, which anyone can forge.
+if len((settings.jwt_secret or "").strip()) < 32:
+    raise RuntimeError("JWT_SECRET is missing or shorter than 32 characters; refusing to start.")
+
+STATIC_ROOT = Path(__file__).resolve().parent / "static"
+ADMIN_STATIC_DIR = STATIC_ROOT / "admin"
+EMPLOYEE_STATIC_DIR = STATIC_ROOT / "employee"
+DEPO_STATIC_DIR = STATIC_ROOT / "depo"
+BUILD_VERSION_FILE = STATIC_ROOT / "build_version.txt"
+
+
+class SPAStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):  # type: ignore[override]
+        def apply_cache_headers(response: Response, request_path: str) -> Response:
+            file_name = Path(request_path).name
+            if file_name in {"index.html", "admin-app.js", "admin-app.css", "admin-app2.css"}:
+                response.headers["Cache-Control"] = "no-cache"
+            return response
+
+        try:
+            response = await super().get_response(path, scope)
+            return apply_cache_headers(response, path)
+        except StarletteHTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            # Keep 404 for missing assets (e.g. .js/.css), but return SPA index for route paths.
+            if "." in Path(path).name:
+                raise
+            response = await super().get_response("index.html", scope)
+            return apply_cache_headers(response, "index.html")
+
+
+def mount_spa(app_instance: FastAPI, *, url_prefix: str, static_dir: Path, name: str) -> None:
+    app_instance.mount(
+        url_prefix,
+        SPAStaticFiles(directory=str(static_dir), html=True, check_dir=False),
+        name=name,
+    )
+
+
+def read_ui_build_version() -> str:
+    try:
+        value = BUILD_VERSION_FILE.read_text(encoding="utf-8-sig").strip()
+    except FileNotFoundError:
+        return "unknown"
+    except OSError:
+        return "unknown"
+    return value or "unknown"
+
+
+def _is_https_request(request: Request) -> bool:
+    forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    if forwarded_proto:
+        return forwarded_proto == "https"
+    return request.url.scheme.lower() == "https"
+
+
+def _ensure_cookie_attr(cookie_value: str, attr: str) -> str:
+    if attr.lower() in cookie_value.lower():
+        return cookie_value
+    return f"{cookie_value}; {attr}"
+
+
+def _harden_set_cookie_headers(response: JSONResponse | Any, *, is_https: bool) -> None:
+    if not hasattr(response, "headers"):
+        return
+    set_cookie_values = response.headers.getlist("set-cookie")
+    if not set_cookie_values:
+        return
+
+    del response.headers["set-cookie"]
+    for raw_cookie in set_cookie_values:
+        cookie = raw_cookie
+        cookie_name = raw_cookie.split("=", 1)[0].strip().lower()
+        sensitive_cookie = any(
+            key in cookie_name
+            for key in ("session", "token", "auth", "refresh", "jwt")
+        )
+
+        if sensitive_cookie:
+            cookie = _ensure_cookie_attr(cookie, "HttpOnly")
+            if is_https:
+                cookie = _ensure_cookie_attr(cookie, "Secure")
+            cookie = _ensure_cookie_attr(cookie, "SameSite=Strict")
+        elif "samesite=" not in cookie.lower():
+            cookie = _ensure_cookie_attr(cookie, "SameSite=Lax")
+
+        response.headers.append("set-cookie", cookie)
+
+
+def _build_csp_header_value() -> str:
+    settings = get_settings()
+    frame_ancestor = "'none'"
+    if settings.portal_sso_enabled and settings.portal_embed_origin:
+        parsed_origin = urlparse(settings.portal_embed_origin)
+        if parsed_origin.scheme in {"http", "https"} and parsed_origin.netloc:
+            frame_ancestor = f"{parsed_origin.scheme}://{parsed_origin.netloc}"
+    return "; ".join(
+        (
+            "default-src 'self'",
+            "base-uri 'self'",
+            f"frame-ancestors {frame_ancestor}",
+            "object-src 'none'",
+            "form-action 'self'",
+            "script-src 'self'",
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+            "img-src 'self' data: blob: https://*.tile.openstreetmap.org https://tile.openstreetmap.org https://tiles.openfreemap.org",
+            "connect-src 'self' wss: https://nominatim.openstreetmap.org https://*.tile.openstreetmap.org https://tiles.openfreemap.org",
+            "font-src 'self' data: https://tiles.openfreemap.org https://fonts.gstatic.com",
+            "worker-src 'self' blob:",
+            "manifest-src 'self'",
+        )
+    )
+
+
+def _apply_security_headers(request: Request, response: JSONResponse | Any) -> None:
+    if not get_settings().security_headers_enabled:
+        return
+
+    is_https = _is_https_request(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    portal_embed_enabled = bool(get_settings().portal_sso_enabled and get_settings().portal_embed_origin)
+    if not portal_embed_enabled:
+        response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "geolocation=(self), microphone=(), camera=(self), payment=()")
+    response.headers.setdefault("Cross-Origin-Resource-Policy", "same-site" if portal_embed_enabled else "same-origin")
+    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+
+    content_type = (response.headers.get("content-type") or "").lower()
+    is_html_response = "text/html" in content_type
+    is_docs_path = request.url.path.startswith("/docs") or request.url.path.startswith("/redoc")
+    if is_html_response and not is_docs_path:
+        csp_header_name = (
+            "Content-Security-Policy-Report-Only"
+            if get_settings().security_csp_report_only
+            else "Content-Security-Policy"
+        )
+        response.headers.setdefault(csp_header_name, _build_csp_header_value())
+
+    if is_https:
+        hsts_seconds = max(0, int(get_settings().security_hsts_max_age_seconds or 0))
+        if hsts_seconds > 0:
+            response.headers.setdefault(
+                "Strict-Transport-Security",
+                f"max-age={hsts_seconds}; includeSubDomains",
+            )
+
+    _harden_set_cookie_headers(response, is_https=is_https)
+
+
+app = FastAPI(title=settings.app_name, version="0.1.0")
+app.add_middleware(PortalTenantHostMiddleware, settings=settings)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def _validation_field_label(loc: tuple[Any, ...] | list[Any]) -> str:
+    parts = [str(item) for item in loc if str(item) not in {"body", "query", "path", "header", "cookie"}]
+    if not parts:
+        return "istek"
+    return ".".join(parts)
+
+
+def _format_validation_error_message(exc: RequestValidationError) -> str:
+    errors = exc.errors()
+    if not errors:
+        return "Gecersiz istek."
+
+    first = errors[0]
+    loc = first.get("loc")
+    error_type = str(first.get("type") or "")
+    message = str(first.get("msg") or "Gecersiz deger.")
+    ctx = first.get("ctx")
+    context = ctx if isinstance(ctx, dict) else {}
+    field_label = _validation_field_label(loc if isinstance(loc, (list, tuple)) else [])
+
+    if error_type == "string_too_short":
+        min_length = context.get("min_length")
+        if isinstance(min_length, int):
+            return f"{field_label} alani en az {min_length} karakter olmali."
+    if error_type == "string_too_long":
+        max_length = context.get("max_length")
+        if isinstance(max_length, int):
+            return f"{field_label} alani en fazla {max_length} karakter olabilir."
+    if error_type in {"missing", "value_error.missing"}:
+        return f"{field_label} alani zorunludur."
+    if error_type in {"int_parsing", "float_parsing"}:
+        return f"{field_label} alani sayisal bir deger olmali."
+    if error_type == "bool_parsing":
+        return f"{field_label} alani true/false degeri olmali."
+
+    return f"{field_label}: {message}"
+
+
+@app.middleware("http")
+async def request_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-Id") or str(uuid4())
+    request.state.request_id = request_id
+    request.state.actor = getattr(request.state, "actor", "system")
+    request.state.actor_id = getattr(request.state, "actor_id", "system")
+
+    start = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers["X-Request-Id"] = request_id
+        _apply_security_headers(request, response)
+        return response
+    finally:
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        logger.info(
+            "request_complete",
+            extra={
+                "request_id": request_id,
+                "path": request.url.path,
+                "method": request.method,
+                "status_code": status_code,
+                "latency_ms": latency_ms,
+                "actor": getattr(request.state, "actor", "system"),
+                "actor_id": getattr(request.state, "actor_id", "system"),
+                "employee_id": getattr(request.state, "employee_id", None),
+                "event_id": getattr(request.state, "event_id", None),
+                "location_status": getattr(request.state, "location_status", None),
+                "flags": getattr(request.state, "flags", None),
+            },
+        )
+
+
+@app.exception_handler(ApiError)
+async def handle_api_error(request: Request, exc: ApiError) -> JSONResponse:
+    return error_response(
+        request,
+        status_code=exc.status_code,
+        code=exc.code,
+        message=exc.message,
+    )
+
+
+@app.exception_handler(HTTPException)
+async def handle_http_exception(request: Request, exc: HTTPException) -> JSONResponse:
+    status_code = exc.status_code
+    code_map = {
+        401: "INVALID_TOKEN",
+        403: "FORBIDDEN",
+        429: "TOO_MANY_ATTEMPTS",
+    }
+    code = code_map.get(status_code, "HTTP_ERROR")
+    message = str(exc.detail) if exc.detail else "Request failed."
+    return error_response(
+        request,
+        status_code=status_code,
+        code=code,
+        message=message,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    return error_response(
+        request,
+        status_code=422,
+        code="VALIDATION_ERROR",
+        message=_format_validation_error_message(exc),
+    )
+
+
+@app.exception_handler(Exception)
+async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception(
+        "unhandled_error",
+        extra={
+            "request_id": getattr(request.state, "request_id", "unknown"),
+            "path": request.url.path,
+            "method": request.method,
+        },
+    )
+    return error_response(
+        request,
+        status_code=500,
+        code="INTERNAL_ERROR",
+        message="Unexpected server error.",
+    )
+
+
+app.include_router(attendance.router)
+app.include_router(admin.router)
+app.include_router(payroll.router)
+app.include_router(ozluk.router)
+app.include_router(assistant.router)
+app.include_router(depo_router)
+app.include_router(depo_portal.router)
+app.include_router(depo_yonetim.router)
+app.include_router(portal_sso.router)
+
+
+def _default_schema_guard_result() -> SchemaGuardResult:
+    return SchemaGuardResult(
+        ok=False,
+        checked_at_utc=datetime.now(timezone.utc),
+        issues=["SCHEMA_GUARD_NOT_RUN"],
+        warnings=[],
+    )
+
+
+async def _notification_worker_loop(stop_event: asyncio.Event) -> None:
+    interval_seconds = max(15, int(settings.notification_worker_interval_seconds))
+    demo_monitor_interval_seconds = 300
+    admin_claim_health_interval_seconds = max(
+        300,
+        int(settings.admin_push_healthcheck_interval_seconds or 0),
+    )
+    last_daily_alarm_signature: str | None = None
+    last_daily_health_signature: str | None = None
+    last_daily_health_logged_ts: datetime | None = None
+    last_admin_claim_health_check_ts: datetime | None = None
+    last_demo_monitor_check_ts: datetime | None = None
+    health_log_interval_seconds = max(300, interval_seconds)
+    while not stop_event.is_set():
+        created_jobs_count = 0
+        processed_jobs_count = 0
+        repaired_auto_checkout_events = 0
+        daily_report_health: dict[str, Any] | None = None
+        admin_claim_health_summary: dict[str, Any] | None = None
+        try:
+            now_utc = datetime.now(timezone.utc)
+            repaired_auto_checkout_events = await asyncio.to_thread(
+                repair_auto_midnight_checkout_events,
+                now_utc,
+            )
+            created_jobs = await asyncio.to_thread(schedule_missed_checkout_notifications, now_utc)
+            missing_checkin_jobs = await asyncio.to_thread(schedule_missing_checkin_notifications, now_utc)
+            await asyncio.to_thread(check_break_over_limits, now_utc)
+            should_run_demo_monitor = (
+                last_demo_monitor_check_ts is None
+                or (now_utc - last_demo_monitor_check_ts).total_seconds() >= demo_monitor_interval_seconds
+            )
+            if should_run_demo_monitor:
+                demo_monitor_jobs = await asyncio.to_thread(schedule_demo_monitor_notifications, now_utc)
+                last_demo_monitor_check_ts = now_utc
+            else:
+                demo_monitor_jobs = []
+            daily_jobs = await asyncio.to_thread(schedule_daily_admin_report_archive_notifications, now_utc)
+            scheduled_task_jobs = await asyncio.to_thread(enqueue_due_scheduled_notification_tasks, now_utc)
+            processed_jobs = await asyncio.to_thread(send_pending_notifications, 100, now_utc=now_utc)
+            daily_report_health = await asyncio.to_thread(get_daily_report_job_health, now_utc)
+            if settings.admin_push_healthcheck_enabled:
+                should_run_claim_health = (
+                    last_admin_claim_health_check_ts is None
+                    or (now_utc - last_admin_claim_health_check_ts).total_seconds()
+                    >= admin_claim_health_interval_seconds
+                )
+                if should_run_claim_health:
+                    admin_claim_health_summary = await asyncio.to_thread(
+                        run_admin_push_claim_health_check,
+                        stale_after_minutes=max(
+                            5,
+                            int(settings.admin_push_healthcheck_stale_minutes or 0),
+                        ),
+                        batch_size=max(
+                            1,
+                            int(settings.admin_push_healthcheck_batch_size or 0),
+                        ),
+                    )
+                    last_admin_claim_health_check_ts = now_utc
+                    notification_worker_logger.info(
+                        "notification_admin_claim_health_check",
+                        extra=admin_claim_health_summary,
+                    )
+            created_jobs_count = (
+                len(created_jobs)
+                + len(missing_checkin_jobs)
+                + len(demo_monitor_jobs)
+                + len(daily_jobs)
+                + len(scheduled_task_jobs)
+            )
+            processed_jobs_count = len(processed_jobs)
+        except Exception:
+            notification_worker_logger.exception("notification_worker_tick_failed")
+        else:
+            alarms = (
+                daily_report_health.get("alarms", [])
+                if isinstance(daily_report_health, dict)
+                else []
+            )
+            alarm_signature = (
+                "|".join(str(item) for item in alarms)
+                if isinstance(alarms, list) and alarms
+                else None
+            )
+            if alarm_signature is not None and alarm_signature != last_daily_alarm_signature:
+                notification_worker_logger.error(
+                    "notification_daily_report_alarm",
+                    extra=daily_report_health if isinstance(daily_report_health, dict) else {},
+                )
+                if isinstance(daily_report_health, dict):
+                    try:
+                        alarm_dispatch_result = await asyncio.to_thread(
+                            dispatch_daily_report_alarm,
+                            daily_report_health=daily_report_health,
+                            cleared=False,
+                        )
+                    except Exception:
+                        notification_worker_logger.exception(
+                            "notification_daily_report_alarm_dispatch_failed"
+                        )
+                    else:
+                        notification_worker_logger.info(
+                            "notification_daily_report_alarm_dispatched",
+                            extra={
+                                "status": alarm_dispatch_result.get("status"),
+                                "configured_channels": alarm_dispatch_result.get("configured_channels"),
+                                "successful_channels": alarm_dispatch_result.get("successful_channels"),
+                            },
+                        )
+                last_daily_alarm_signature = alarm_signature
+            elif alarm_signature is None and last_daily_alarm_signature is not None:
+                notification_worker_logger.info(
+                    "notification_daily_report_alarm_cleared",
+                    extra=daily_report_health if isinstance(daily_report_health, dict) else {},
+                )
+                if isinstance(daily_report_health, dict):
+                    try:
+                        alarm_dispatch_result = await asyncio.to_thread(
+                            dispatch_daily_report_alarm,
+                            daily_report_health=daily_report_health,
+                            cleared=True,
+                        )
+                    except Exception:
+                        notification_worker_logger.exception(
+                            "notification_daily_report_alarm_clear_dispatch_failed"
+                        )
+                    else:
+                        notification_worker_logger.info(
+                            "notification_daily_report_alarm_clear_dispatched",
+                            extra={
+                                "status": alarm_dispatch_result.get("status"),
+                                "configured_channels": alarm_dispatch_result.get("configured_channels"),
+                                "successful_channels": alarm_dispatch_result.get("successful_channels"),
+                            },
+                        )
+                last_daily_alarm_signature = None
+
+            if isinstance(daily_report_health, dict):
+                health_signature = "|".join(
+                    (
+                        str(daily_report_health.get("report_date") or ""),
+                        str(daily_report_health.get("status") or ""),
+                        str(bool(daily_report_health.get("job_exists"))),
+                        str(bool(daily_report_health.get("archive_exists"))),
+                        str(daily_report_health.get("push_total_targets") or 0),
+                        str(daily_report_health.get("push_sent") or 0),
+                        str(daily_report_health.get("push_failed") or 0),
+                        str(daily_report_health.get("email_sent") or 0),
+                        ",".join(
+                            str(item)
+                            for item in (
+                                daily_report_health.get("alarms")
+                                if isinstance(daily_report_health.get("alarms"), list)
+                                else []
+                            )
+                        ),
+                    )
+                )
+                should_log_health = health_signature != last_daily_health_signature
+                if (not should_log_health) and last_daily_health_logged_ts is not None:
+                    elapsed_seconds = (now_utc - last_daily_health_logged_ts).total_seconds()
+                    should_log_health = elapsed_seconds >= health_log_interval_seconds
+                if should_log_health:
+                    notification_worker_logger.info(
+                        "notification_daily_report_health",
+                        extra=daily_report_health,
+                    )
+                    last_daily_health_signature = health_signature
+                    last_daily_health_logged_ts = now_utc
+
+            if created_jobs_count or processed_jobs_count or repaired_auto_checkout_events:
+                notification_worker_logger.info(
+                    "notification_worker_tick",
+                    extra={
+                        "created_jobs": created_jobs_count,
+                        "processed_jobs": processed_jobs_count,
+                        "repaired_auto_checkout_events": repaired_auto_checkout_events,
+                        "daily_report_health": daily_report_health or {},
+                        "admin_claim_health": admin_claim_health_summary or {},
+                    },
+                )
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+        except asyncio.TimeoutError:
+            continue
+
+
+_SCHEMA_GUARD_TRANSIENT_RETRIES = 6
+_SCHEMA_GUARD_TRANSIENT_DELAY_SECONDS = 2.0
+
+
+@app.on_event("startup")
+async def create_development_schema() -> None:
+    if settings.auto_create_schema:
+        await asyncio.to_thread(Base.metadata.create_all, engine)
+
+
+@app.on_event("startup")
+async def run_schema_guard() -> None:
+    result = await asyncio.to_thread(verify_runtime_schema, engine)
+    # DB deploy sirasinda gec hazir olabilir: tablolar bir an OperationalError ile okunamaz.
+    # Bu gecici durumda boot'u oldurmek yerine kisa araliklarla birkac kez tekrar dene;
+    # gercek sema sapmasinda (eksik kolon/enum) retry tetiklenmez, hemen patlar.
+    attempts = 0
+    while (
+        not result.ok
+        and schema_issues_all_transient(result.issues)
+        and attempts < _SCHEMA_GUARD_TRANSIENT_RETRIES
+    ):
+        attempts += 1
+        notification_worker_logger.warning(
+            "schema_guard_transient_retry",
+            extra={"attempt": attempts, "issues": result.issues},
+        )
+        await asyncio.sleep(_SCHEMA_GUARD_TRANSIENT_DELAY_SECONDS)
+        result = await asyncio.to_thread(verify_runtime_schema, engine)
+
+    app.state.schema_guard_result = result
+    if result.ok:
+        notification_worker_logger.info(
+            "schema_guard_ok",
+            extra=result.to_dict(),
+        )
+        return
+
+    notification_worker_logger.error(
+        "schema_guard_failed",
+        extra=result.to_dict(),
+    )
+    if settings.schema_guard_strict:
+        joined_issues = "; ".join(result.issues)
+        raise RuntimeError(f"Runtime schema guard failed: {joined_issues}")
+
+
+def _seed_depo_admin_sync() -> None:
+    pin = (settings.depo_admin_pin or "").strip()
+    if not pin:
+        return
+    db = SessionLocal()
+    try:
+        existing = db.query(DepoUser).first()
+        if existing is not None:
+            return
+        db.add(DepoUser(ad="admin", pin_hash=depo_hash_pin(pin), rol="admin"))
+        db.commit()
+        notification_worker_logger.info("depo_admin_seeded")
+    finally:
+        db.close()
+
+
+@app.on_event("startup")
+async def seed_depo_admin() -> None:
+    # Mirrors depojin's own startup seed (backend/app/main.py lifespan): create an initial
+    # depo admin user with a PIN if none exists yet. Opt-in via DEPO_ADMIN_PIN; if unset,
+    # skip seeding entirely (depo users can then only be created once one already exists,
+    # which is intentional - no default/weak PIN gets created silently).
+    try:
+        await asyncio.to_thread(_seed_depo_admin_sync)
+    except Exception:
+        notification_worker_logger.exception("depo_admin_seed_failed")
+
+
+@app.on_event("startup")
+async def start_notification_worker() -> None:
+    if not settings.notification_worker_enabled:
+        return
+    if getattr(app.state, "notification_worker_task", None) is not None:
+        return
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(_notification_worker_loop(stop_event))
+    app.state.notification_worker_stop_event = stop_event
+    app.state.notification_worker_task = task
+    notification_channel_health = await asyncio.to_thread(get_notification_channel_health)
+    email_status = notification_channel_health.get("email", {}) if isinstance(notification_channel_health, dict) else {}
+    email_enabled = bool(email_status.get("enabled")) if isinstance(email_status, dict) else False
+    missing_fields = email_status.get("missing_fields", []) if isinstance(email_status, dict) else []
+    if email_enabled and isinstance(missing_fields, list) and missing_fields:
+        notification_worker_logger.warning(
+            "notification_email_channel_not_configured",
+            extra={"missing_fields": missing_fields},
+        )
+    if not email_enabled:
+        notification_worker_logger.info("notification_email_channel_disabled")
+    notification_worker_logger.info(
+        "notification_worker_started",
+        extra={
+            "interval_seconds": max(15, int(settings.notification_worker_interval_seconds)),
+            "channel_health": notification_channel_health,
+        },
+    )
+
+
+@app.on_event("shutdown")
+async def stop_notification_worker() -> None:
+    stop_event: asyncio.Event | None = getattr(app.state, "notification_worker_stop_event", None)
+    task: asyncio.Task[None] | None = getattr(app.state, "notification_worker_task", None)
+    if stop_event is not None:
+        stop_event.set()
+    if task is not None:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+    app.state.notification_worker_stop_event = None
+    app.state.notification_worker_task = None
+
+
+@app.api_route("/healthz", methods=["GET", "HEAD"], include_in_schema=False)
+def healthz() -> Response:
+    # Lightweight probe endpoint (no DB/service checks) for uptime monitors.
+    return Response(content="ok", media_type="text/plain")
+
+
+@app.head("/health", include_in_schema=False)
+def health_head() -> Response:
+    # Keep HEAD cheap so monitors using HEAD do not fail with 405.
+    return Response(status_code=200)
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    schema_guard_result: SchemaGuardResult = getattr(app.state, "schema_guard_result", _default_schema_guard_result())
+    notification_channel_health = get_notification_channel_health()
+    daily_report_job_health = get_daily_report_job_health()
+    return {
+        "status": "ok",
+        "ui_build_version": read_ui_build_version(),
+        "schema_guard": schema_guard_result.to_dict(),
+        "notification_channels": notification_channel_health,
+        "daily_report_job_health": daily_report_job_health,
+    }
+
+
+mount_spa(app, url_prefix="/admin-panel", static_dir=ADMIN_STATIC_DIR, name="admin-panel")
+mount_spa(app, url_prefix="/employee", static_dir=EMPLOYEE_STATIC_DIR, name="employee")
+mount_spa(app, url_prefix="/depo", static_dir=DEPO_STATIC_DIR, name="depo")

@@ -8,5 +8,11 @@ backend/.env
 frontend/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
+modules/puantaj/.pytest_cache/
+modules/puantaj/**/__pycache__/
+modules/puantaj/**/node_modules/
+modules/puantaj/**/dist/
+modules/puantaj/app/static/
 *.pyc
 *.log
+.local/

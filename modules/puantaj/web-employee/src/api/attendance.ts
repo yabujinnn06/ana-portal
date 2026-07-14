@@ -1,0 +1,500 @@
+﻿import axios from 'axios'
+
+import { apiClient } from './client'
+import type {
+  ApiErrorShape,
+  AttendanceActionResponse,
+  AttendanceCheckinRequest,
+  AttendanceCheckoutRequest,
+  BreakStatusRecord,
+  DeviceClaimRequest,
+  DeviceClaimResponse,
+  DepoOzetResponse,
+  EmployeeConversationRecord,
+  EmployeeConversationThreadRecord,
+  EmployeeDemoDayResponse,
+  EmployeeAppPresencePingRequest,
+  EmployeeAppPresencePingResponse,
+  EmployeeInstallFunnelEventRequest,
+  EmployeeInstallFunnelEventResponse,
+  EmployeeLeaveRecord,
+  EmployeeLeaveRequest,
+  EmployeeLeaveThreadRecord,
+  EmployeeQrScanRequest,
+  EmployeeQrScanDeniedResponse,
+  EmployeePushConfigResponse,
+  EmployeePushSubscribeRequest,
+  EmployeePushSubscribeResponse,
+  EmployeePushUnsubscribeRequest,
+  EmployeePushUnsubscribeResponse,
+  EmployeeHomeLocationSetRequest,
+  EmployeeHomeLocationSetResponse,
+  EmployeeStatusResponse,
+  PasskeyRecoverOptionsResponse,
+  PasskeyRecoverVerifyRequest,
+  PasskeyRecoverVerifyResponse,
+  PasskeyRegisterOptionsRequest,
+  PasskeyRegisterOptionsResponse,
+  PasskeyRegisterVerifyRequest,
+  PasskeyRegisterVerifyResponse,
+  RecoveryCodeIssueRequest,
+  RecoveryCodeIssueResponse,
+  RecoveryCodeRevealRequest,
+  RecoveryCodeRevealResponse,
+  RecoveryCodeRecoverRequest,
+  RecoveryCodeRecoverResponse,
+  RecoveryCodeStatusResponse,
+} from '../types/api'
+
+export interface ParsedApiError {
+  message: string
+  code?: string
+  requestId?: string
+}
+
+const defaultBase = typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1:8000'
+const keepaliveBaseUrl = String(apiClient.defaults.baseURL ?? defaultBase).replace(/\/$/, '')
+
+const errorCodeMap: Record<string, string> = {
+  INVALID_TOKEN: 'Geçersiz oturum belirteci.',
+  FORBIDDEN: 'Bu işlem için yetkiniz yok.',
+  EMPLOYEE_INACTIVE: 'Çalışan pasif durumda olduğu için işlem yapılamıyor.',
+  DEVICE_NOT_CLAIMED: 'Cihaz bağlı değil. Lütfen davet linkine tıklayın.',
+  HOME_LOCATION_ALREADY_SET: 'Ev konumu zaten kayıtlı. Değişiklik için İK ile iletişime geçin.',
+  CHECKIN_REQUIRED: 'Önce QR ile giriş yapmalısınız.',
+  ALREADY_CHECKED_IN: 'Bugün zaten giriş yaptınız. Mesaiyi bitirmeniz bekleniyor.',
+  ALREADY_CHECKED_OUT: 'Bugün için çıkış işlemi zaten yapılmış.',
+  DAY_ALREADY_FINISHED: 'Bugünkü mesai tamamlandı. Yeni giriş yarın yapılabilir.',
+  SECOND_CHECKIN_APPROVAL_REQUIRED:
+    'Bugünkü ikinci giriş için admin onayı gerekiyor. Admin onayından sonra tekrar deneyin.',
+  PASSKEY_DISABLED: 'Passkey özelliği şu anda devre dışı.',
+  PASSKEY_RUNTIME_UNAVAILABLE: 'Passkey altyapısı hazır değil.',
+  PASSKEY_CHALLENGE_NOT_FOUND: 'Passkey doğrulama oturumu bulunamadı.',
+  PASSKEY_CHALLENGE_USED: 'Bu passkey doğrulama oturumu daha önce kullanılmış.',
+  PASSKEY_CHALLENGE_EXPIRED: 'Passkey doğrulama süresi doldu.',
+  PASSKEY_REGISTRATION_FAILED: 'Passkey kaydı doğrulanamadı.',
+  PASSKEY_AUTH_FAILED: 'Passkey doğrulaması başarısız oldu.',
+  PASSKEY_NOT_REGISTERED: 'Bu cihaz için passkey kaydı bulunamadı.',
+  RECOVERY_PIN_INVALID: 'Recovery PIN hatali.',
+  RECOVERY_CODE_INVALID: 'Recovery code hatali.',
+  RECOVERY_CODES_NOT_READY: 'Bu hesapta aktif recovery code yok veya suresi dolmus.',
+  RECOVERY_CODES_REVEAL_UNAVAILABLE:
+    'Mevcut recovery kodlari gosterilemiyor. Yeni bir recovery seti olusturun.',
+  QR_POINT_OUT_OF_RANGE: 'Bu QR kod sadece tanımlı konum içinde okutulabilir.',
+  QR_CODE_NOT_FOUND: 'QR kod bulunamadı veya pasif durumda.',
+  QR_CODE_HAS_NO_ACTIVE_POINTS: 'Bu QR koda aktif konum noktası atanmadı.',
+  QR_DOUBLE_SCAN_BLOCKED: 'Aynı çalışan için QR okutmalar arasında en az 5 dakika olmalıdır.',
+  LEAVE_OVERLAP: 'Bu tarihler icin zaten aktif bir izin talebi veya onayli izin var.',
+  PUSH_NOT_CONFIGURED: 'Bildirim servisi şu anda aktif değil.',
+  INVALID_PUSH_SUBSCRIPTION: 'Bildirim abonelik verisi geçersiz.',
+  INVITE_ATTEMPTS_EXCEEDED: 'Davet linkinin deneme limiti doldu. Yeni bir link isteyin.',
+  INVITE_NOT_FOUND: 'Davet bağlantısı geçersiz veya bulunamadı. Yeni bir link isteyin.',
+  INVITE_EXPIRED: 'Davet bağlantısının süresi dolmuş. Yeni bir link isteyin.',
+  INVITE_ALREADY_USED:
+    'Bu davet bağlantısı daha önce kullanılmış. Uygulama açılmıyorsa İK’dan yeni link isteyin.',
+  INVITE_CONTEXT_MISMATCH: 'Davet linki ayni cihaz/tarayici baglaminda kullanilmalidir.',
+  INVITE_RETRY_TOO_FAST: 'Cok hizli deneme yaptiniz. Birkac saniye sonra tekrar deneyin.',
+  DEVICE_FINGERPRINT_CONFLICT: 'Bu cihaz başka bir çalışana bağlı görünüyor. İK ile iletişime geçin.',
+  DEVICE_ALREADY_REGISTERED: 'Bu cihaz daha önce kaydedilmiş. İK ile iletişime geçin.',
+  INTERNAL_ERROR: 'Sunucuda kisa bir sorun oldu. Tekrar dene.',
+  HTTP_ERROR: 'Istek sirasinda sunucu hatasi olustu. Tekrar dene.',
+}
+
+const backendDetailMap: Record<string, string> = {
+  'Invite token not found': 'Davet bağlantısı geçersiz veya bulunamadı.',
+  'Invite token expired': 'Davet bağlantısının süresi dolmuş.',
+  'Invite token already used': 'Bu davet bağlantısı daha önce kullanılmış.',
+  'Device fingerprint already belongs to another employee':
+    'Bu cihaz başka bir çalışana bağlı görünüyor. İK ile iletişime geçin.',
+}
+
+export function parseApiError(error: unknown, fallback: string): ParsedApiError {
+  if (axios.isAxiosError(error)) {
+    // Sunucudan yanit gelmediyse (baglanti kopuk / timeout) net Turkce mesaj.
+    if (!error.response) {
+      return { code: 'NETWORK_ERROR', message: 'Bağlantı hatası. İnternet bağlantınızı kontrol edip tekrar deneyin.' }
+    }
+    const data = error.response?.data as
+      | ApiErrorShape
+      | EmployeeQrScanDeniedResponse
+      | string
+      | undefined
+    if (typeof data === 'string') {
+      return { message: data }
+    }
+
+    const errorObj =
+      typeof data === 'object' && data !== null && 'error' in data && typeof data.error === 'object'
+        ? (data.error as { code?: string; request_id?: string; message?: string })
+        : undefined
+    const code = errorObj?.code
+    const requestId = errorObj?.request_id
+    const detail =
+      typeof data === 'object' && data !== null && 'detail' in data
+        ? (data.detail as string | undefined)
+        : undefined
+    const backendMessage = errorObj?.message
+    const deniedReason =
+      typeof data === 'object' && data !== null && 'reason' in data
+        ? (data.reason as string | undefined)
+        : undefined
+    const deniedDistance =
+      typeof data === 'object' && data !== null && 'closest_distance_m' in data
+        ? (data.closest_distance_m as number | null | undefined)
+        : undefined
+
+    if (deniedReason === 'QR_POINT_OUT_OF_RANGE') {
+      const distanceText =
+        typeof deniedDistance === 'number' ? `${Math.round(deniedDistance)}m` : 'bilinmiyor'
+      return {
+        code: deniedReason,
+        requestId,
+        message: `Bu QR kod bu konumda geçerli değil. En yakın nokta: ${distanceText}.`,
+      }
+    }
+
+    if (code && code.startsWith('PASSKEY_') && backendMessage) {
+      return { code, requestId, message: backendMessage }
+    }
+    if (detail && backendDetailMap[detail]) {
+      return { code, requestId, message: backendDetailMap[detail] }
+    }
+    if (code && errorCodeMap[code]) {
+      return { code, requestId, message: errorCodeMap[code] }
+    }
+    if (backendMessage) {
+      return { code, requestId, message: backendMessage }
+    }
+    if (detail) {
+      return { code, requestId, message: detail }
+    }
+    if (error.message) {
+      return { message: error.message }
+    }
+  }
+
+  if (error instanceof Error && error.message) {
+    return { message: error.message }
+  }
+  return { message: fallback }
+}
+
+export async function claimDevice(payload: DeviceClaimRequest): Promise<DeviceClaimResponse> {
+  const response = await apiClient.post<DeviceClaimResponse>('/api/device/claim', payload)
+  return response.data
+}
+
+export async function checkin(payload: AttendanceCheckinRequest): Promise<AttendanceActionResponse> {
+  const response = await apiClient.post<AttendanceActionResponse>('/api/attendance/checkin', payload)
+  return response.data
+}
+
+export async function checkout(payload: AttendanceCheckoutRequest): Promise<AttendanceActionResponse> {
+  const response = await apiClient.post<AttendanceActionResponse>('/api/attendance/checkout', payload)
+  return response.data
+}
+
+export async function scanEmployeeQr(payload: EmployeeQrScanRequest): Promise<AttendanceActionResponse> {
+  const response = await apiClient.post<AttendanceActionResponse>('/api/employee/qr/scan', payload)
+  return response.data
+}
+
+export async function getBreakStatus(deviceFingerprint: string): Promise<BreakStatusRecord> {
+  const response = await apiClient.post<BreakStatusRecord>('/api/attendance/break/status', {
+    device_fingerprint: deviceFingerprint,
+  })
+  return response.data
+}
+
+export async function startBreak(deviceFingerprint: string): Promise<BreakStatusRecord> {
+  const response = await apiClient.post<BreakStatusRecord>('/api/attendance/break/start', {
+    device_fingerprint: deviceFingerprint,
+  })
+  return response.data
+}
+
+export async function endBreak(deviceFingerprint: string): Promise<BreakStatusRecord> {
+  const response = await apiClient.post<BreakStatusRecord>('/api/attendance/break/end', {
+    device_fingerprint: deviceFingerprint,
+  })
+  return response.data
+}
+
+export async function setEmployeeHomeLocation(
+  payload: EmployeeHomeLocationSetRequest,
+): Promise<EmployeeHomeLocationSetResponse> {
+  const response = await apiClient.post<EmployeeHomeLocationSetResponse>(
+    '/api/employee/home-location',
+    payload,
+  )
+  return response.data
+}
+
+export async function getEmployeeStatus(deviceFingerprint: string): Promise<EmployeeStatusResponse> {
+  const response = await apiClient.get<EmployeeStatusResponse>('/api/employee/status', {
+    params: { device_fingerprint: deviceFingerprint },
+  })
+  return response.data
+}
+
+export async function getEmployeeDemoHistory(deviceFingerprint: string): Promise<EmployeeDemoDayResponse> {
+  const response = await apiClient.get<EmployeeDemoDayResponse>('/api/employee/demo-history', {
+    params: { device_fingerprint: deviceFingerprint },
+  })
+  return response.data
+}
+
+export async function getEmployeeLeaves(deviceFingerprint: string): Promise<EmployeeLeaveRecord[]> {
+  const response = await apiClient.get<EmployeeLeaveRecord[]>('/api/employee/leaves', {
+    params: { device_fingerprint: deviceFingerprint },
+  })
+  return response.data
+}
+
+export async function createEmployeeLeaveRequest(
+  payload: EmployeeLeaveRequest,
+): Promise<EmployeeLeaveRecord> {
+  const response = await apiClient.post<EmployeeLeaveRecord>('/api/employee/leaves', payload)
+  return response.data
+}
+
+export async function submitEmployeeLeaveRequest(
+  payload: FormData,
+): Promise<EmployeeLeaveRecord> {
+  const response = await apiClient.post<EmployeeLeaveRecord>('/api/employee/leaves/submit', payload, {
+    headers: {
+      'Content-Type': 'multipart/form-data',
+    },
+  })
+  return response.data
+}
+
+export async function getEmployeeLeaveThread(
+  leaveId: number,
+  deviceFingerprint: string,
+): Promise<EmployeeLeaveThreadRecord> {
+  const response = await apiClient.get<EmployeeLeaveThreadRecord>(`/api/employee/leaves/${leaveId}/thread`, {
+    params: { device_fingerprint: deviceFingerprint },
+  })
+  return response.data
+}
+
+export async function createEmployeeLeaveMessage(
+  leaveId: number,
+  payload: { device_fingerprint: string; message: string },
+): Promise<EmployeeLeaveThreadRecord> {
+  const response = await apiClient.post<EmployeeLeaveThreadRecord>(`/api/employee/leaves/${leaveId}/messages`, payload)
+  return response.data
+}
+
+export async function downloadEmployeeLeaveAttachment(
+  leaveId: number,
+  attachmentId: number,
+  deviceFingerprint: string,
+): Promise<{ blob: Blob; fileName: string | null; contentType: string | null }> {
+  const response = await apiClient.get<Blob>(`/api/employee/leaves/${leaveId}/attachments/${attachmentId}/download`, {
+    params: { device_fingerprint: deviceFingerprint },
+    responseType: 'blob',
+  })
+  const contentDisposition = response.headers['content-disposition']
+  const rawContentType = response.headers['content-type']
+  const fileNameMatch =
+    typeof contentDisposition === 'string'
+      ? /filename="?([^";]+)"?/i.exec(contentDisposition)
+      : null
+  return {
+    blob: response.data,
+    fileName: fileNameMatch?.[1] ?? null,
+    contentType: typeof rawContentType === 'string' ? rawContentType : null,
+  }
+}
+
+export async function getEmployeeConversations(deviceFingerprint: string): Promise<EmployeeConversationRecord[]> {
+  const response = await apiClient.get<EmployeeConversationRecord[]>('/api/employee/communications', {
+    params: { device_fingerprint: deviceFingerprint },
+  })
+  return response.data
+}
+
+export async function createEmployeeConversation(
+  payload: {
+    device_fingerprint: string
+    category: string
+    subject: string
+    message: string
+  },
+): Promise<EmployeeConversationThreadRecord> {
+  const response = await apiClient.post<EmployeeConversationThreadRecord>('/api/employee/communications', payload)
+  return response.data
+}
+
+export async function getEmployeeConversationThread(
+  conversationId: number,
+  deviceFingerprint: string,
+): Promise<EmployeeConversationThreadRecord> {
+  const response = await apiClient.get<EmployeeConversationThreadRecord>(
+    `/api/employee/communications/${conversationId}/thread`,
+    {
+      params: { device_fingerprint: deviceFingerprint },
+    },
+  )
+  return response.data
+}
+
+export async function createEmployeeConversationMessage(
+  conversationId: number,
+  payload: { device_fingerprint: string; message: string },
+): Promise<EmployeeConversationThreadRecord> {
+  const response = await apiClient.post<EmployeeConversationThreadRecord>(
+    `/api/employee/communications/${conversationId}/messages`,
+    payload,
+  )
+  return response.data
+}
+
+export async function postEmployeeAppPresencePing(
+  payload: EmployeeAppPresencePingRequest,
+): Promise<EmployeeAppPresencePingResponse> {
+  const response = await apiClient.post<EmployeeAppPresencePingResponse>(
+    '/api/employee/app-presence/ping',
+    payload,
+  )
+  return response.data
+}
+
+export async function postEmployeeAppPresencePingKeepalive(
+  payload: EmployeeAppPresencePingRequest,
+): Promise<void> {
+  if (typeof window === 'undefined' || typeof fetch === 'undefined') {
+    return
+  }
+  try {
+    await fetch(`${keepaliveBaseUrl}/api/employee/app-presence/ping`, {
+      method: 'POST',
+      keepalive: true,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    })
+  } catch {
+    // best effort
+  }
+}
+
+export async function postEmployeeInstallFunnelEvent(
+  payload: EmployeeInstallFunnelEventRequest,
+): Promise<EmployeeInstallFunnelEventResponse> {
+  const response = await apiClient.post<EmployeeInstallFunnelEventResponse>(
+    '/api/employee/install-funnel-event',
+    payload,
+  )
+  return response.data
+}
+
+export async function getEmployeePushConfig(): Promise<EmployeePushConfigResponse> {
+  const response = await apiClient.get<EmployeePushConfigResponse>('/api/employee/push/config')
+  return response.data
+}
+
+export async function subscribeEmployeePush(
+  payload: EmployeePushSubscribeRequest,
+): Promise<EmployeePushSubscribeResponse> {
+  const response = await apiClient.post<EmployeePushSubscribeResponse>(
+    '/api/employee/push/subscribe',
+    payload,
+  )
+  return response.data
+}
+
+export async function unsubscribeEmployeePush(
+  payload: EmployeePushUnsubscribeRequest,
+): Promise<EmployeePushUnsubscribeResponse> {
+  const response = await apiClient.post<EmployeePushUnsubscribeResponse>(
+    '/api/employee/push/unsubscribe',
+    payload,
+  )
+  return response.data
+}
+
+export async function getPasskeyRegisterOptions(
+  payload: PasskeyRegisterOptionsRequest,
+): Promise<PasskeyRegisterOptionsResponse> {
+  const response = await apiClient.post<PasskeyRegisterOptionsResponse>(
+    '/api/device/passkey/register/options',
+    payload,
+  )
+  return response.data
+}
+
+export async function verifyPasskeyRegistration(
+  payload: PasskeyRegisterVerifyRequest,
+): Promise<PasskeyRegisterVerifyResponse> {
+  const response = await apiClient.post<PasskeyRegisterVerifyResponse>(
+    '/api/device/passkey/register/verify',
+    payload,
+  )
+  return response.data
+}
+
+export async function getPasskeyRecoverOptions(): Promise<PasskeyRecoverOptionsResponse> {
+  const response = await apiClient.post<PasskeyRecoverOptionsResponse>('/api/device/passkey/recover/options')
+  return response.data
+}
+
+export async function verifyPasskeyRecover(
+  payload: PasskeyRecoverVerifyRequest,
+): Promise<PasskeyRecoverVerifyResponse> {
+  const response = await apiClient.post<PasskeyRecoverVerifyResponse>(
+    '/api/device/passkey/recover/verify',
+    payload,
+  )
+  return response.data
+}
+
+export async function issueRecoveryCodes(
+  payload: RecoveryCodeIssueRequest,
+): Promise<RecoveryCodeIssueResponse> {
+  const response = await apiClient.post<RecoveryCodeIssueResponse>(
+    '/api/device/recovery-codes/issue',
+    payload,
+  )
+  return response.data
+}
+
+export async function getRecoveryCodeStatus(
+  deviceFingerprint: string,
+): Promise<RecoveryCodeStatusResponse> {
+  const response = await apiClient.get<RecoveryCodeStatusResponse>(
+    '/api/device/recovery-codes/status',
+    { params: { device_fingerprint: deviceFingerprint } },
+  )
+  return response.data
+}
+
+export async function revealRecoveryCodes(
+  payload: RecoveryCodeRevealRequest,
+): Promise<RecoveryCodeRevealResponse> {
+  const response = await apiClient.post<RecoveryCodeRevealResponse>(
+    '/api/device/recovery-codes/reveal',
+    payload,
+  )
+  return response.data
+}
+
+export async function recoverDeviceWithCode(
+  payload: RecoveryCodeRecoverRequest,
+): Promise<RecoveryCodeRecoverResponse> {
+  const response = await apiClient.post<RecoveryCodeRecoverResponse>(
+    '/api/device/recovery-codes/recover',
+    payload,
+  )
+  return response.data
+}
+
+export async function getDepoOzet(deviceFingerprint: string): Promise<DepoOzetResponse> {
+  const response = await apiClient.post<DepoOzetResponse>('/api/depo/portal/ozet', {
+    device_fingerprint: deviceFingerprint,
+  })
+  return response.data
+}
